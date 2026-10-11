@@ -59,52 +59,117 @@ CTX_LEN = 8192
 
 
 # ---------------------------------------------------------------------------
-# Card load monitor: a SECOND, independent ssh channel. The chat protocol
-# channel is fully occupied during generation (token stream), so utilization
-# sampling cannot share it. BusyBox loop emits a 3-line cycle once/second:
-#   cpu  user nice system idle iowait irq softirq ...      <- /proc/stat
-#   MemTotal: N kB                                          <- /proc/meminfo
-#   MemFree:  N kB
-# busy% is computed from the jiffies delta between cycles.
+# Card load monitor: TWO independent ssh channels (the chat protocol channel
+# is fully occupied during generation).
+#
+# Measured cost on the card (BusyBox loop, 2026-10-11):
+#   cat /proc/meminfo   ~6 ms/sample   (cheap: 1 Hz, always on)
+#   cat /proc/stat     ~420 ms/sample, ~330 ms in-kernel (formats 244 HT
+#                       threads' counters) -- at 1 Hz this visibly stalls the
+#                       OMP workers: 3.60 -> 2.30 tok/s. So /proc/stat is
+#                       SUSPENDED while a turn runs (zero interference) and
+#                       sampled at 0.5 Hz only while idle.
 # ---------------------------------------------------------------------------
 class LoadMonitor:
-    CARD_LOOP = ("while :; do head -n 1 /proc/stat; "
-                 "grep MemTotal /proc/meminfo; grep MemFree /proc/meminfo; "
-                 "sleep 1; done")
+    MEM_LOOP = "while :; do cat /proc/meminfo; sleep 1; done"
+    CPU_LOOP = "while :; do cat /proc/stat; sleep 2; done"
 
     def __init__(self, host: str):
         self.host = host
-        self.proc: subprocess.Popen | None = None
+        self.mem_proc: subprocess.Popen | None = None
+        self.cpu_proc: subprocess.Popen | None = None
         self.stop_flag = False
+        self.cpu_suspended = False         # True while a turn generates
         self.last = {"cpu": None, "mem": None}     # replayed to late joiners
 
     def start(self):
-        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._mem_run, daemon=True).start()
+        threading.Thread(target=self._cpu_run, daemon=True).start()
 
     def close(self):
         self.stop_flag = True
-        if self.proc is not None:
+        for p in (self.mem_proc, self.cpu_proc):
+            if p is not None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+    # -- cpu sampling suspension (called by the turn worker) -----------------
+    def suspend_cpu(self):
+        self.cpu_suspended = True
+        p = self.cpu_proc
+        self.cpu_proc = None
+        if p is not None:
             try:
-                self.proc.kill()       # remote loop dies on closed channel
+                p.kill()               # remote loop dies on closed channel
             except OSError:
                 pass
+        self.last["cpu"] = None
+        publish("load", {"cpu": None, "mem": self.last["mem"],
+                         "paused": True})
 
-    def _spawn(self):
-        cmd = ["ssh", *chat._ssh_base(self.host), self.host, self.CARD_LOOP]
+    def resume_cpu(self):
+        self.cpu_suspended = False     # _cpu_run respawns on its own
+
+    # -- ssh plumbing ---------------------------------------------------------
+    def _spawn(self, loop: str):
+        cmd = ["ssh", *chat._ssh_base(self.host), self.host, loop]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True,
                                 errors="replace", bufsize=1)
 
-    def _run(self):
-        prev = None                                  # (busy, total) jiffies
+    def _wait_or_stop(self, seconds: float):
+        for _ in range(int(seconds * 10)):
+            if self.stop_flag:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def _mem_run(self):
         mem_total = None
         while not self.stop_flag:
             try:
-                if self.proc is None or self.proc.poll() is not None:
-                    self.proc = self._spawn()
-                line = self.proc.stdout.readline()
+                if self.mem_proc is None or self.mem_proc.poll() is not None:
+                    self.mem_proc = self._spawn(self.MEM_LOOP)
+                line = self.mem_proc.stdout.readline()
                 if not line:
-                    raise ConnectionError("monitor ssh channel closed")
+                    raise ConnectionError("mem monitor channel closed")
+                parts = line.split()
+                if parts and parts[0] == "MemTotal:":
+                    mem_total = int(parts[1])
+                elif parts and parts[0] == "MemFree:" and mem_total:
+                    self.last["mem"] = 100.0 * (mem_total - int(parts[1])) / mem_total
+                    publish("load", {"cpu": self.last["cpu"],
+                                     "mem": self.last["mem"],
+                                     "paused": self.cpu_suspended})
+            except Exception:
+                if self.mem_proc is not None:
+                    try:
+                        self.mem_proc.kill()
+                    except OSError:
+                        pass
+                self.mem_proc = None
+                self.last["mem"] = None
+                publish("load", {"cpu": self.last["cpu"], "mem": None,
+                                 "paused": self.cpu_suspended})
+                if not self._wait_or_stop(5):
+                    return
+
+    def _cpu_run(self):
+        prev = None                                  # (busy, total) jiffies
+        while not self.stop_flag:
+            try:
+                if self.cpu_suspended:
+                    prev = None                      # jiffies jump: rebase
+                    if not self._wait_or_stop(0.5):
+                        return
+                    continue
+                if self.cpu_proc is None or self.cpu_proc.poll() is not None:
+                    self.cpu_proc = self._spawn(self.CPU_LOOP)
+                line = self.cpu_proc.stdout.readline()
+                if not line:
+                    raise ConnectionError("cpu monitor channel closed")
                 parts = line.split()
                 if parts and parts[0] == "cpu":
                     vals = [int(x) for x in parts[1:9]]
@@ -113,25 +178,17 @@ class LoadMonitor:
                     if prev is not None and total > prev[1]:
                         self.last["cpu"] = 100.0 * (busy - prev[0]) / (total - prev[1])
                     prev = (busy, total)
-                elif parts and parts[0] == "MemTotal:":
-                    mem_total = int(parts[1])
-                elif parts and parts[0] == "MemFree:" and mem_total:
-                    self.last["mem"] = 100.0 * (mem_total - int(parts[1])) / mem_total
-                    publish("load", dict(self.last))
             except Exception:
-                # channel dropped / card rebooting: degrade silently, retry
-                if self.proc is not None:
+                if self.cpu_proc is not None:
                     try:
-                        self.proc.kill()
+                        self.cpu_proc.kill()
                     except OSError:
                         pass
-                self.proc = None
-                self.last = {"cpu": None, "mem": None}
-                publish("load", dict(self.last))
-                for _ in range(50):                  # 5 s, but stop promptly
-                    if self.stop_flag:
-                        return
-                    time.sleep(0.1)
+                self.cpu_proc = None
+                self.last["cpu"] = None
+                if not self._wait_or_stop(5):
+                    return
+
 
 # ---------------------------------------------------------------------------
 # HTML page (dark theme, Chinese labels)
@@ -234,7 +291,7 @@ PAGE = r"""<!DOCTYPE html>
     <span>速度 <b id="st-speed">–</b> tok/s</span>
     <span>已生成 <b id="st-total">0</b> tok</span>
     <span>上下文 <b id="st-ctx">0/8192</b></span>
-    <span title="61 核 244 线程的合计占用(第二条 ssh 通道独立采样)">内核 <b id="st-cpu">–</b>%<span class="meter"><i id="bar-cpu"></i></span></span>
+    <span title="61 核 244 线程合计占用。生成期间暂停采样(读 /proc/stat 会拖慢推理 36%),显示 ⏸">内核 <b id="st-cpu">–</b>%<span class="meter"><i id="bar-cpu"></i></span></span>
     <span title="卡上 15.5 GB 内存(tmpfs,含模型文件驻留)">内存 <b id="st-mem">–</b>%<span class="meter"><i id="bar-mem"></i></span></span>
   </div>
 </header>
@@ -429,7 +486,8 @@ es.addEventListener("reset", () => {
 });
 es.addEventListener("load", e => {
   const d = JSON.parse(e.data);
-  setMeter(barCpu, stCpu, d.cpu);
+  if (d.paused) { stCpu.textContent = "⏸"; barCpu.style.width = "0%"; }
+  else setMeter(barCpu, stCpu, d.cpu);
   setMeter(barMem, stMem, d.mem);
 });
 es.onerror = () => setConn("bad", "SSE 断开,重连中…");
@@ -516,6 +574,10 @@ def run_turn(text: str):
     """One full user turn. Called in a worker thread with turn_lock held."""
     tok, client = STATE.tok, STATE.client
     total0 = STATE.total_gen
+    # /proc/stat sampling stalls the OMP workers (measured: -36% tok/s);
+    # suspend it for the whole OMP-hot turn (prefill + generation).
+    if STATE.monitor is not None:
+        STATE.monitor.suspend_cpu()
     try:
         ids = tok.encode(USER_BLOCK.format(text))
         if STATE.first_turn:
@@ -556,6 +618,8 @@ def run_turn(text: str):
     except Exception as e:                 # never kill the worker silently
         publish("error", {"message": f"内部错误: {e!r}"})
     finally:
+        if STATE.monitor is not None:
+            STATE.monitor.resume_cpu()
         STATE.turn_lock.release()
 
 

@@ -67,7 +67,8 @@ try:
     print(f"[e2e] idle load events OK: cpu={idle[-1][1]['cpu']:.1f}% "
           f"mem={idle[-1][1]['mem']:.1f}%", flush=True)
 
-    # one generation turn; load monitor must keep publishing through it
+    # one generation turn; the cpu sampler must be SUSPENDED during it
+    # (measured: /proc/stat reads at 1 Hz cost ~36% tok/s on k1om)
     NO_PROXY.open(urllib.request.Request(
         URL + "/api/send", data=json.dumps({"text": "用一句话介绍北京"}).encode(),
         headers={"Content-Type": "application/json"}), timeout=30)
@@ -77,15 +78,23 @@ try:
         if any(e == "done" for e, d in events[n0:]):
             break
         time.sleep(2)
-    gen_loads = [d for e, d in events[n0:] if e == "load" and d.get("cpu") is not None]
+    gen_loads = [d for e, d in events[n0:] if e == "load"]
     done = [d for e, d in events[n0:] if e == "done"]
     assert done, "turn never finished"
     assert gen_loads, "load monitor stalled during generation"
-    peak = max(d["cpu"] for d in gen_loads)
+    assert all(d.get("paused") for d in gen_loads), \
+        "cpu sampler was not suspended during generation"
+    assert done[-1]["tok_s"] >= 3.0, \
+        f"tok/s still degraded: {done[-1]['tok_s']}"
+    # cpu sampling resumes after the turn
+    time.sleep(6)
+    resumed = [d for e, d in events if e == "load"
+               and d.get("cpu") is not None and not d.get("paused")]
+    assert resumed, "cpu sampler did not resume after the turn"
     print(f"[e2e] turn done: {done[-1]}", flush=True)
-    print(f"[e2e] load events during generation: {len(gen_loads)}, "
-          f"peak cpu={peak:.0f}% (idle was {idle[-1][1]['cpu']:.0f}%)", flush=True)
-    assert peak > idle[-1][1]["cpu"] + 20, "cpu% did not rise during generation?"
+    print(f"[e2e] load events during generation: {len(gen_loads)} "
+          f"(cpu sampling paused, mem live), resumed cpu={resumed[-1]['cpu']:.0f}%",
+          flush=True)
     print("LOAD E2E PASS", flush=True)
 finally:
     srv.kill()
