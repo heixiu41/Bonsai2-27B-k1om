@@ -303,12 +303,24 @@ def ensure_card_files(host: str, gguf: str) -> bool:
     The model is 7.2 GB and the card deletes it after every chat session
     (see note in main()), so this is the normal per-session path."""
     base = _ssh_base(host)
-    try:
-        r = subprocess.run(["ssh", *base, host,
-                            "ls /tmp/bonsai_k1om_chat /tmp/bonsai.gguf 2>/dev/null"],
-                           capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"[fatal] cannot reach the card: {e}", file=sys.stderr)
+    # The card reboots from time to time (tmpfs /tmp is wiped); its sshd
+    # comes up well after the network stack, so a single 30 s probe can land
+    # in the boot window. Retry for up to ~3 minutes before giving up.
+    r = None
+    for attempt in range(6):
+        try:
+            r = subprocess.run(["ssh", *base, host,
+                                "ls /tmp/bonsai_k1om_chat /tmp/bonsai.gguf 2>/dev/null"],
+                               capture_output=True, text=True, timeout=35)
+            break
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"[card] reach attempt {attempt + 1}/6 failed: {e}; "
+                  f"retrying in 25 s (card may still be booting)",
+                  file=sys.stderr, flush=True)
+            time.sleep(25)
+    if r is None:
+        print("[fatal] cannot reach the card after 6 attempts",
+              file=sys.stderr)
         return False
     have = r.stdout
     if "bonsai_k1om_chat" not in have:
