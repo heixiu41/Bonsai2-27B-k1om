@@ -1,0 +1,379 @@
+=========================================================================
+pq2aid_card_evidence.txt -- raw card output for the ISA-map + F-series work
+host: Xeon Phi 7120P (k1om), mic0 192.168.1.100, Linux 2.6.38.8+mpss3.8.6
+=========================================================================
+
+### A. intrinsic availability scan (pq2isa_scan.ps1; one intrinsic per TU,
+###    compiled with -mmic -S; a real instruction prints a mnemonic, an
+###    unimplemented one prints 'call _mm512_*' = undefined at link.)
+i32_permutevar         OK                       vpermd
+i32_mask_permutevar    OK                       kmov vpermd
+i32_permute4f128       OK                       vpermf32x4
+ps_permute4f128        OK                       vpermf32x4
+i32_swizzle            OK                       
+ps_swizzle             OK                       
+i32_shuffle            OK                       vpshufd
+ps_shuffle             NOT-IMPLEMENTED(call)    _mm512_shuffle_ps
+i32_alignr             OK                       valignd
+i64_alignr             NOT-IMPLEMENTED(call)    _mm512_alignr_epi64
+i8_alignr              NOT-IMPLEMENTED(call)    _mm512_alignr_epi8
+i32_ternarylogic       NOT-IMPLEMENTED(call)    _mm512_ternarylogic_epi32
+i32_shuffle_i32x4      NOT-IMPLEMENTED(call)    _mm512_shuffle_i32x4
+i32_permutexvar        NOT-IMPLEMENTED(call)    _mm512_permutexvar_epi32
+i32_permutex2var       NOT-IMPLEMENTED(call)    _mm512_permutex2var_epi32
+i16_permutexvar        NOT-IMPLEMENTED(call)    _mm512_permutexvar_epi16
+i8_permutexvar         NOT-IMPLEMENTED(call)    _mm512_permutexvar_epi8
+i128_bslli             NOT-IMPLEMENTED(call)    _mm512_bslli_epi128
+i128_bsrli             NOT-IMPLEMENTED(call)    _mm512_bsrli_epi128
+i32_rolv               NOT-IMPLEMENTED(call)    _mm512_rolv_epi32
+i32_ror                NOT-IMPLEMENTED(call)    _mm512_ror_epi32
+i32_sllv               OK                       vpsllvd
+i32_srlv               OK                       vpsrlvd
+i32_slli               OK                       vpslld
+i32_srli               OK                       vpsrld
+i32_srai               OK                       vpsrad
+i16_slli               NOT-IMPLEMENTED(call)    _mm512_slli_epi16
+i16_srli               NOT-IMPLEMENTED(call)    _mm512_srli_epi16
+i16_sllv               NOT-IMPLEMENTED(call)    _mm512_sllv_epi16
+i32_mullo              OK                       vpmulld
+i32_mulhi              OK                       vpmulhd
+i32_mulhi_epu          OK                       vpmulhud
+i16_mullo              NOT-IMPLEMENTED(call)    _mm512_mullo_epi16
+i16_madd               NOT-IMPLEMENTED(call)    _mm512_madd_epi16
+i16_maddubs            NOT-IMPLEMENTED(call)    _mm512_maddubs_epi16
+i16_mulhrs             NOT-IMPLEMENTED(call)    _mm512_mulhrs_epi16
+i32_add                OK                       vpaddd
+i32_sub                OK                       vpsubd
+i32_and                OK                       vpandd
+i32_or                 OK                       vpord
+i32_xor                OK                       vpxord
+i32_andnot             OK                       vpandnd
+i8_add                 NOT-IMPLEMENTED(call)    _mm512_add_epi8
+i8_sub                 NOT-IMPLEMENTED(call)    _mm512_sub_epi8
+i8_adds                NOT-IMPLEMENTED(call)    _mm512_adds_epi8
+i8_subs                NOT-IMPLEMENTED(call)    _mm512_subs_epi8
+i8_adds_epu            NOT-IMPLEMENTED(call)    _mm512_adds_epu8
+i8_subs_epu            NOT-IMPLEMENTED(call)    _mm512_subs_epu8
+i8_abs                 NOT-IMPLEMENTED(call)    _mm512_abs_epi8
+i16_abs                NOT-IMPLEMENTED(call)    _mm512_abs_epi16
+i16_add                NOT-IMPLEMENTED(call)    _mm512_add_epi16
+i16_sub                NOT-IMPLEMENTED(call)    _mm512_sub_epi16
+i8_avg                 NOT-IMPLEMENTED(call)    _mm512_avg_epu8
+i16_avg                NOT-IMPLEMENTED(call)    _mm512_avg_epu16
+i8_sad                 NOT-IMPLEMENTED(call)    _mm512_sad_epu8
+i8_dbsad               NOT-IMPLEMENTED(call)    _mm512_dbsad_epu8
+i8_max_epu             NOT-IMPLEMENTED(call)    _mm512_max_epu8
+i8_min_epu             NOT-IMPLEMENTED(call)    _mm512_min_epu8
+i16_packs              NOT-IMPLEMENTED(call)    _mm512_packs_epi16
+i16_packus             NOT-IMPLEMENTED(call)    _mm512_packus_epi16
+i32_cvtepi32_ps        NOT-IMPLEMENTED(call)    _mm512_cvt_roundepi32_ps
+i32_cvtps_epi32        NOT-IMPLEMENTED(call)    _mm512_cvt_roundps_epi32
+i32_cvtepu32_ps        NOT-IMPLEMENTED(call)    _mm512_cvt_roundepu32_ps
+ph_cvtph_ps            REJECTED-AT-COMPILE      movdqa
+extload_epi32_u8       OK                       
+extload_ps_u8          OK                       
+extload_ps_f16         OK                       
+extload_ps_s16         OK                       
+extloadunpacklo_u8     OK                       vloadunpackld
+extloadunpackhi_u8     OK                       vloadunpackhd
+gather_epi32_u16       OK                       kortest kxnor vpgatherdd
+gather_ps_f16          OK                       kortest kxnor vgatherdps
+gather_ps_none         OK                       kortest kxnor vgatherdps
+ps_fmadd233            OK                       vfmadd233ps
+i32_fmadd233           OK                       vpmadd233d
+ps_exp2a23             NOT-IMPLEMENTED(call)    _mm512_exp2a23_round_ps
+ps_scale               OK                       vscaleps
+ps_rsqrt23             OK                       vrsqrt23ps
+ps_maxabs              NOT-IMPLEMENTED(call)    _mm512_maxabs_ps
+ps_gmaxabs             OK                       vgmaxabsps
+ps_addsets             OK                       kmov kxnor vaddsetsps
+i32_subsetb            OK                       kmov vpsubsetbd
+i32_addsetc            OK                       kmov vpaddsetcd
+i32_lzcnt              NOT-IMPLEMENTED(call)    _mm512_lzcnt_epi32
+i32_conflict           NOT-IMPLEMENTED(call)    _mm512_conflict_epi32
+i32_popcnt             COMPILE-ERROR            error: return value type does not match the function type
+i8_multishift          NOT-IMPLEMENTED(call)    _mm512_multishift_epi64_epi8
+i8_shuffle_epi8        NOT-IMPLEMENTED(call)    _mm512_shuffle_epi8
+i8_unpacklo            NOT-IMPLEMENTED(call)    _mm512_unpacklo_epi8
+i16_unpacklo           NOT-IMPLEMENTED(call)    _mm512_unpacklo_epi16
+i32_unpacklo           NOT-IMPLEMENTED(call)    _mm512_unpacklo_epi32
+i8_broadcastb          REJECTED-AT-COMPILE      movdqa
+i32_cmpgt_mask         OK                       kmov vpcmpd
+i8_cmpgt_mask          NOT-IMPLEMENTED(call)    _mm512_cmp_epi8_mask
+ps_load                OK                       
+i32_load               OK                       
+i32_store              OK                       
+i32_set1_epi8          OK                       vpbroadcastd
+i32_set1_epi16         OK                       vpbroadcastd
+
+### B. instruction throughput + semantics (pq2isa2 0/1)
+=== throughput (8 independent chains, 200000 iterations) ===
+ns per instruction; 1 core clock ~= 0.808 ns at 1.238 GHz
+  addd              1.681 ns/op
+  andd              1.647 ns/op
+  ord               1.646 ns/op
+  srli              1.645 ns/op
+  slli              1.657 ns/op
+  srlv              1.648 ns/op
+  sllv              1.644 ns/op
+  mulld             1.646 ns/op
+  mulhd             1.656 ns/op
+  vpermd            1.648 ns/op
+  vpermd2           1.645 ns/op
+  permf32x4         1.654 ns/op
+  vpshufd           1.647 ns/op
+  valignd           1.645 ns/op
+  swizzle           1.645 ns/op
+  ldepi32           1.653 ns/op
+  ldextu8           1.646 ns/op
+  ldexunpl          4.937 ns/op
+  cmpeq             3.267 ns/op
+  ---
+  addps             1.643 ns/op   [float]
+  subps             1.663 ns/op   [float]
+  mulps             1.645 ns/op   [float]
+  fmadd             1.646 ns/op   [float]
+  scaleps           1.644 ns/op   [float]
+  fmadd233          1.644 ns/op   [float]
+  maxps             3.266 ns/op   [float]
+  gmaxabs           1.653 ns/op   [float]
+  ldps              1.646 ns/op   [float]
+  ldextpsu8         2.051 ns/op   [float]
+  ldextpsf16        2.052 ns/op   [float]
+ssh : sh: line 1: 12841 Segmentation fault      /tmp/pq2isa2 0 200000
+???? ?:14 ??: 1
++ ssh -i "$key" $kh root@192.168.1.100 "export LD_LIBRARY_PATH=/tmp &&  ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (sh: line 1: 128...q2isa2 0 200000:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== semantics ===
+inputs: ii = 0..15, ff = 0..15, b8[i]=3i+1, h16[i]=0x3C00+i (fp16 1.0+), x32[i]=1000+i
+
+[vfmadd233ps]  a=ii  b=ff+16 (i.e. b[i]=16+i)
+  a                          0           1           2           3           4           5           6           7           8           9          10          11          12          13          14          15
+  b                         16          17          18          19          20          21          22          23          24          25          26          27          28          29          30          31
+  fmadd233(a,b)             16          33          50          67         104         125         146         167         224         249         274         299         376         405         434         463
+  fmadd233(b,a)             16          17          18          19         104         109         114         119         224         233         242         251         376         389         402         415
+  a*b+2^23 (ref)     8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06   8.389e+06
+
+[vpmadd233d]  a=0..15  b=1000+i
+  a                          0           1           2           3           4           5           6           7           8           9          10          11          12          13          14          15
+  b                       1000        1001        1002        1003        1004        1005        1006        1007        1008        1009        1010        1011        1012        1013        1014        1015
+  madd233(a,b)            1000        2001        3002        4003        5024        6029        7034        8039        9080       10089       11098       12107       13168       14181       15194       16207
+  madd233(b,a)            1000        1001        1002        1003        5024        5029        5034        5039        9080        9089        9098        9107       13168       13181       13194       13207
+
+[vscaleps]  a=1.5, b=0..15 -> expect 1.5*2^b
+  scale(a,b)               1.5           3           6          12          24          48          96         192         384         768        1536        3072        6144   1.229e+04   2.458e+04   4.915e+04
+
+[extload_ps UINT8]  b8=3i+1 -> expect 3i+1 as float
+  u8                         1           4           7          10          13          16          19          22          25          28          31          34          37          40          43          46
+[extload_ps FLOAT16] h16=0x3C00+i (=1.0 + i*2^-10)
+  f16                        1       1.001       1.002       1.003       1.004       1.005       1.006       1.007       1.008       1.009        1.01       1.011       1.012       1.013       1.014       1.015
+[extload_ps SINT16] x32=1000+i
+  s16                     1000           0        1001           0        1002           0        1003           0        1004           0        1005           0        1006           0        1007           0
+[extload_epi32 UINT8]
+  u8                         1           4           7          10          13          16          19          22          25          28          31          34          37          40          43          46
+[extloadunpacklo_epi32 UINT8]  (dst=zero)
+  lo                         1           4           7          10          13          16          19          22          25          28          31          34          37          40          43          46
+  hi                         0           0           0           0           0           0           0           0           0           0           0           0           0           0           0           0
+[extload_ps UINT8 with 4X16 broadcast]
+  bc4x16                     1           4           7          10           1           4           7          10           1           4           7          10           1           4           7          10
+  bc1x16                     1           1           1           1           1           1           1           1           1           1           1           1           1           1           1           1
+
+[permutes]  data = 0..15 (dword lanes)
+  data                       0           1           2           3           4           5           6           7           8           9          10          11          12          13          14          15
+  perm4f128 0x1B            12          13          14          15           8           9          10          11           4           5           6           7           0           1           2           3
+  perm4f128 0xE4             0           1           2           3           4           5           6           7           8           9          10          11          12          13          14          15
+  perm4f128 0x00             0           1           2           3           0           1           2           3           0           1           2           3           0           1           2           3
+  vpshufd 0x1B               3           2           1           0           7           6           5           4          11          10           9           8          15          14          13          12
+  valignd(d,d,3)             3           4           5           6           7           8           9          10          11          12          13          14          15           0           1           2
+  valignd(d,e,3)           103         104         105         106         107         108         109         110         111         112         113         114         115           0           1           2
+  swz NONE                   0           1           2           3           4           5           6           7           8           9          10          11          12          13          14          15
+  swz CDAB                   1           0           3           2           5           4           7           6           9           8          11          10          13          12          15          14
+  swz BADC                   2           3           0           1           6           7           4           5          10          11           8           9          14          15          12          13
+  swz AAAA                   0           0           0           0           4           4           4           4           8           8           8           8          12          12          12          12
+  swz BBBB                   1           1           1           1           5           5           5           5           9           9           9           9          13          13          13          13
+  swz CCCC                   2           2           2           2           6           6           6           6          10          10          10          10          14          14          14          14
+  swz DDDD                   3           3           3           3           7           7           7           7          11          11          11          11          15          15          15          15
+  swz DACB                   1           2           0           3           5           6           4           7           9          10           8          11          13          14          12          15
+  swz_ps CDAB                1           0           3           2           5           4           7           6           9           8          11          10          13          12          15          14
+  swz_ps AAAA                0           0           0           0           4           4           4           4           8           8           8           8          12          12          12          12
+  swz_ps DACB                1           2           0           3           5           6           4           7           9          10           8          11          13          14          12          15
+
+[mulhi]
+  mulhd(a,a)         268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456
+  mulhud(a,a)        268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456   268435456
+  mulld(a,a)                 0           0           0           0           0           0           0           0           0           0           0           0           0           0           0           0
+
+[set-mask arith]  a=0..15, b=10
+  a                          0           1           2           3           4           5           6           7           8           9          10          11          12          13          14          15
+  addsetc(a,b)              10          11          12          13          14          15          16          17          18          19          20          21          22          23          24          25
+  addsetc mask = 0000
+  subsetb(a,b)             -10          -9          -8          -7          -6          -5          -4          -3          -2          -1           0           1           2           3           4           5
+  subsetb mask = 03ff
+  addsets_ps(a,b)           10          11          12          13          14          15          16          17          18          19          20          21          22          23          24          25
+  addsets mask = 0000
+
+[gather]  base = b8 (bytes 3i+1), offsets = i*2, scale=1
+  gather_epi32 u16        1025        2567        4109        5651        7193        8735       10277       11819       13361       14903       16445       17987       19529       21071       22613       24155
+  gather_ps u8               1           4           7          10          13          16          19          22          25          28          31          34          37          40          43          46
+  gather_ps f16              1       1.001       1.002       1.003       1.004       1.005       1.006       1.007       1.008       1.009        1.01       1.011       1.012       1.013       1.014       1.015
+
+### C. pq2f1: single-binary head-to-head (V1/V10c anchors + F-series)
+=== pq2f1: one binary, all anchors ===
+n=5120 rows=512 reps=5 nblk=40 row_bytes=1360
+
+--- element-wise vs V1: 64 alignments x (128 unit vectors + row sum), 2 blocks ---
+  F0  V10c (prev best)           MISMATCHES = 0  *** EXACT ***
+  F1  2 LUTs + scale array       MISMATCHES = 0  *** EXACT ***
+  F2  F1 + 2 blocks in flight    MISMATCHES = 0  *** EXACT ***
+  F3  F1 + 1 partial sum         MISMATCHES = 0  *** EXACT ***
+  F4  F1 + 2 partial sums        MISMATCHES = 0  *** EXACT ***
+  F5  2 LUTs + INLINE scale, 1 t MISMATCHES = 0  *** EXACT ***
+  F6  2 LUTs + INLINE scale, 2 t MISMATCHES = 0  *** EXACT ***
+
+--- multi-block (4 rows) relative diff: n=512 (4 blocks) and n=640 (5 blocks) ---
+  n=512 F0  V10c (prev best)           max rel diff = 1.014e-07  OK
+  n=512 F1  2 LUTs + scale array       max rel diff = 1.014e-07  OK
+  n=512 F2  F1 + 2 blocks in flight    max rel diff = 1.609e-07  OK
+  n=512 F3  F1 + 1 partial sum         max rel diff = 2.028e-07  OK
+  n=512 F4  F1 + 2 partial sums        max rel diff = 8.367e-08  OK
+  n=512 F5  2 LUTs + INLINE scale, 1 t max rel diff = 2.028e-07  OK
+  n=512 F6  2 LUTs + INLINE scale, 2 t max rel diff = 8.367e-08  OK
+  n=640 F0  V10c (prev best)           max rel diff = 1.289e-07  OK
+  n=640 F1  2 LUTs + scale array       max rel diff = 1.289e-07  OK
+  n=640 F2  F1 + 2 blocks in flight    max rel diff = 1.289e-07  OK
+  n=640 F3  F1 + 1 partial sum         max rel diff = 1.014e-07  OK
+  n=640 F4  F1 + 2 partial sums        max rel diff = 6.445e-08  OK
+  n=640 F5  2 LUTs + INLINE scale, 1 t max rel diff = 1.014e-07  OK
+  n=640 F6  2 LUTs + INLINE scale, 2 t max rel diff = 6.445e-08  OK
+
+=== PHASE A: kernel only (drow built ONCE outside the timed loop) ===
+--- pass 0 (single thread, best of 5) ---
+  F0  V10c (prev best)             1059.0 M w/s    1.000x vs V1    1.000x vs V10c
+  F1  2 LUTs + scale array         2202.8 M w/s    2.080x vs V1    2.080x vs V10c
+  F2  F1 + 2 blocks in flight      1831.7 M w/s    1.730x vs V1    1.730x vs V10c
+  F3  F1 + 1 partial sum           2400.3 M w/s    2.267x vs V1    2.267x vs V10c
+  F4  F1 + 2 partial sums          2359.1 M w/s    2.228x vs V1    2.228x vs V10c
+  F5  2 LUTs + INLINE scale, 1 t   1493.3 M w/s    1.410x vs V1    1.410x vs V10c
+  F6  2 LUTs + INLINE scale, 2 t   1548.4 M w/s    1.462x vs V1    1.462x vs V10c
+  (sink=-1.76545e+08)
+--- pass 1 (single thread, best of 5)  [REVERSED ORDER] ---
+  F6  2 LUTs + INLINE scale, 2 t   1542.2 M w/s    1.456x vs V10c
+  F5  2 LUTs + INLINE scale, 1 t   1474.6 M w/s    1.392x vs V10c
+  F4  F1 + 2 partial sums          2343.0 M w/s    2.212x vs V10c
+  F3  F1 + 1 partial sum           2378.2 M w/s    2.246x vs V10c
+  F2  F1 + 2 blocks in flight      1829.6 M w/s    1.728x vs V10c
+  F1  2 LUTs + scale array         2206.4 M w/s    2.083x vs V10c
+  F0  V10c (prev best)             1063.0 M w/s    1.000x vs V10c
+  (sink=-1.76545e+08)
+
+=== PHASE B: whole row work, i.e. scale-array build INCLUDED ===
+--- pass 0 ---
+  F0  V10c (prev best)              823.9 M w/s    1.000x vs V1    0.775x vs V10c
+  F1  2 LUTs + scale array         1257.7 M w/s    1.526x vs V1    1.183x vs V10c
+  F2  F1 + 2 blocks in flight      1105.1 M w/s    1.341x vs V1    1.040x vs V10c
+  F3  F1 + 1 partial sum           1317.0 M w/s    1.598x vs V1    1.239x vs V10c
+  F4  F1 + 2 partial sums          1304.9 M w/s    1.584x vs V1    1.228x vs V10c
+  F5  2 LUTs + INLINE scale, 1 t    971.5 M w/s    1.179x vs V1    0.914x vs V10c
+  F6  2 LUTs + INLINE scale, 2 t   1003.7 M w/s    1.218x vs V1    0.944x vs V10c
+  (sink=1.82424e+08)
+--- pass 1  [REVERSED ORDER] ---
+  F6  2 LUTs + INLINE scale, 2 t   1008.7 M w/s      infx vs V1    0.949x vs V10c
+  F5  2 LUTs + INLINE scale, 1 t    985.2 M w/s      infx vs V1    0.927x vs V10c
+  F4  F1 + 2 partial sums          1304.8 M w/s      infx vs V1    1.227x vs V10c
+  F3  F1 + 1 partial sum           1313.5 M w/s      infx vs V1    1.236x vs V10c
+  F2  F1 + 2 blocks in flight      1107.9 M w/s      infx vs V1    1.042x vs V10c
+  F1  2 LUTs + scale array         1259.9 M w/s      infx vs V1    1.185x vs V10c
+  F0  V10c (prev best)              821.6 M w/s    1.000x vs V1    0.773x vs V10c
+  (sink=1.82424e+08)
+
+  scale-array build alone: 0.9439 ms for 512 rows = 360.1 ps/weight (2777.14 M w/s equivalent)
+
+### D. pq2f2: scale-array builders (+ F3 kernel with each)
+=== pq2f2: cheap scale-array builders ===
+--- gate: every builder vs bonsai_fp16_to_fp32 on all 65536 halves ---
+    B0 i=0 h=7c00
+    B0 i=1 h=7c01
+    B0 i=2 h=7c02
+    B0 i=3 h=7c03
+    B0 scalar branchy : 2048 wrong
+    B1 unrolled8      : 4096 wrong
+    B2 gather+vector  : 0 wrong
+
+--- builders alone (512 rows x 40 blocks) ---
+  B0 scalar branchy        346.9 ps/weight   (0.9093 ms / 512 rows)
+  B1 unrolled8             294.8 ps/weight   (0.7727 ms / 512 rows)
+  B2 gather+vector         203.9 ps/weight   (0.5344 ms / 512 rows)  [repaired groups: see below]
+                       repaired 0 groups (expected 0 for normal scales)
+
+--- F3 kernel + each builder (whole row work, single thread, best of 5) ---
+  B0 scalar branchy      1365.4 M w/s    1.289x vs V10c(1059)    1.487x vs V1(918)
+                       (sink=2.71391e+07)
+  B1 unrolled8           1443.5 M w/s    1.363x vs V10c(1059)    1.572x vs V1(918)
+                       (sink=2.71391e+07)
+  B2 gather+vector       1669.0 M w/s    1.576x vs V10c(1059)    1.818x vs V1(918)
+                       (sink=2.71391e+07)
+
+### E. pq2f3: measured exactness of F3 + B2 (33024 element-wise checks)
+=== pq2f3: measured exactness of F3 + B2 (measured zeros only) ===
+  unit-vector + row-sum gate: 33024 checks (4 blocks x 64 alignments x 129), MISMATCHES = 0  *** EXACT ***
+  (single-block scale groups that took B2's repair path: 0)
+  multi-block n=2048 (16 blocks): 8 rows, max rel diff = 0.000e+00  OK   repairs=8
+  multi-block n=2176 (17 blocks, ODD): 8 rows, max rel diff = 0.000e+00  OK   repairs=8
+  multi-block n=3456 (27 blocks, ODD): 8 rows, max rel diff = 0.000e+00  OK   repairs=8
+  multi-block n=5120 (40 blocks): 8 rows, max rel diff = 0.000e+00  OK   repairs=16
+
+### F. pq2ld1: is the two-instruction LOAD16 pair necessary?
+=== single vloadunpackld vs the two-instruction pair ===
+off  lo-wrong pair-wrong   (lo = one extloadunpacklo with zero dst)
+ 49       1         0
+ 50       2         0
+ 51       3         0
+ 52       4         0
+ 53       5         0
+ 54       6         0
+ 55       7         0
+ 56       8         0
+ 57       9         0
+ 58      10         0
+ 59      11         0
+ 60      12         0
+ 61      13         0
+ 62      14         0
+ 63      15         0
+
+  total lanes checked per variant: 1024
+  one extloadunpacklo (zero dst)  : 120 wrong lanes
+  PQ2_IMCI_LOAD16 (lo + hi pair)  : 0 wrong lanes
+  one extloadunpacklo (dirty dst) : 120 wrong lanes
+  first alignment where the single load fails: 49
+  single-load lanes that change when everything past p's own
+  64-byte block is poisoned: 16 (0 => it never reads past that block)
+
+### G. pq2f2_no-prefetch: same as D but built with -qopt-prefetch=0 (the
+###    16 vprefetch instructions per block cost only ~1.2%)
+=== pq2f2: cheap scale-array builders ===
+--- gate: every builder vs bonsai_fp16_to_fp32 on all 65536 halves ---
+    B0 i=0 h=7c00
+    B0 i=1 h=7c01
+    B0 i=2 h=7c02
+    B0 i=3 h=7c03
+    B0 scalar branchy : 2048 wrong
+    B1 unrolled8      : 4096 wrong
+    B2 gather+vector  : 0 wrong
+
+--- builders alone (512 rows x 40 blocks) ---
+  B0 scalar branchy        336.8 ps/weight   (0.8830 ms / 512 rows)
+  B1 unrolled8             257.9 ps/weight   (0.6760 ms / 512 rows)
+  B2 gather+vector         205.6 ps/weight   (0.5389 ms / 512 rows)  [repaired groups: see below]
+                       repaired 0 groups (expected 0 for normal scales)
+
+--- F3 kernel + each builder (whole row work, single thread, best of 5) ---
+  B0 scalar branchy      1404.7 M w/s    1.326x vs V10c(1059)    1.530x vs V1(918)
+                       (sink=2.71391e+07)
+  B1 unrolled8           1557.9 M w/s    1.471x vs V10c(1059)    1.697x vs V1(918)
+                       (sink=2.71391e+07)
+  B2 gather+vector       1689.6 M w/s    1.595x vs V10c(1059)    1.840x vs V1(918)
+                       (sink=2.71391e+07)

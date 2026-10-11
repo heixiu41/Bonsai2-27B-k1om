@@ -1,0 +1,363 @@
+RAW CARD EVIDENCE -- PQ2_0 decoder V12 investigation
+=====================================================
+Card: Intel Xeon Phi 7120P (Knights Corner / k1om), MPSS 3.8.6
+Clock measured on the card: /proc/cpuinfo cpu MHz = 1238.094 (fixed; KNC has no turbo)
+Compiler: icc 17.0.0, icc -mmic -O3 -std=c11 -D__INTEL_COMPILER_USE_INTRINSIC_PROTOTYPES
+Run method: scp to /tmp, ssh root@192.168.1.100, single thread, best-of-N
+Load average on the card at the time of the runs: 0.00 0.01 0.61 (no other process)
+
+Files in this investigation:
+  src/bonsai/pq2prim.c    primitive throughput table (register + memory ops)
+  src/bonsai/pq2prim2.c   machine model, noinline benches, no LICM
+  src/bonsai/pq2prim3.c   H1 (issue-rate limit) vs H2 (memory-operand limit)
+  src/bonsai/pq2v12.c     V12 candidate: verified exact, first pricing + probes
+  src/bonsai/pq2v13.c     cost attribution for V12 (one change per probe)
+  src/bonsai/pq2v14.c     latency-hiding variants (contains a harness bug, see below)
+  src/bonsai/pq2v15.c     V12 + prescaled scales + K blocks in flight
+  src/bonsai/pq2v16.c     controlled head-to-head: 1 binary, 2 pass orders
+  src/bonsai/srccount.py  instructions emitted per source line from icc -S output
+
+================================================================================
+SECTION 1 -- pq2prim 300000  (primitive table, register-only chains)
+================================================================================
+=== KNC primitive cost table (pq2prim) ===
+single thread, NC=8 independent chains, 300000 iterations each
+vpaddd/vpandd are the 'one cheap ALU op' reference: their ps/op IS
+the core clock period, so every other row is also a cycle count.
+
+primitive                               ps/op    cycles
+  vpaddd           (reference)         1633.5      1.00
+  vpandd                               1638.6      1.00
+  vpord                                1623.9      0.99
+  vpxord                               1623.8      0.99
+  vpsrld imm (srli)                    1630.5      1.00
+  vpsrlvd (srlv)                       1624.1      0.99
+  vpsllvd (sllv)                       1629.2      1.00
+  vpmulld                              1623.8      0.99
+  vpermd  (chain thru index)           1623.8      0.99
+  vpermd  (chain thru data)            1630.7      1.00
+  and+or          (2 ops)              3253.1      1.99
+  and+or+subps    (3 ops)              4875.2      2.98
+  and+or+mulps    (3 ops)              4876.9      2.99
+  vmulps                               1623.8      0.99
+  vaddps                               1628.1      1.00
+  vsubps                               1623.8      0.99
+  vfmadd (213)                         1623.8      0.99
+  vmovaps L1 64B x8                    1642.2      1.01     <- HOISTED, meaningless
+  LOAD16 = lo+hi unpack (2 instr)      1624.0      0.99     <- HOISTED, meaningless
+  --- latency, 1 chain ---                0.0      0.00
+  vpaddd chain                         3248.2      1.99
+  vpermd chain                         4874.2      2.98
+  vpmulld chain                        3251.0      1.99
+  vfmadd chain                         3248.2      1.99
+
+implied core clock if vpaddd == 1 cycle: 1633.5 ps = 0.612 GHz
+KEY RATIOS
+  vpermd / vpaddd         =   1.00
+  vpermd / (and+or)       =   0.50
+  vpermd / (and+or+subps) =   0.33
+  (vpermd+vmulps)/(and+or+subps) = 0.67
+  vfmadd / vpaddd         =   0.99
+  LOAD16 / vpaddd         =   0.99
+  vmovaps / vpaddd        =   1.01
+sink -1272020944 2.44254e+06
+
+NOTE: the two memory rows are meaningless -- the loads were loop-invariant and
+LICM hoisted them.  That is exactly TRAP 1, caught here by inspection and fixed
+in pq2prim2.
+
+================================================================================
+SECTION 2 -- pq2prim2 500000  (noinline benches, pointer-advancing loads)
+================================================================================
+=== KNC primitive cost table (pq2prim2) ===  [selected rows; raw text]
+operation                                    ps/op   cycles
+  vpaddd  (register)                        1014.8  1830.17
+  vpandd  (register)                        1629.2  2938.23
+  vpermd  (register)                        1626.2  2932.65
+  vpmulld (register)                        1625.6  2931.63
+  vfmadd  (register)                        1626.2  2932.66
+  vmulps  (register)                        1627.7  2935.44
+  and+or  (2 ops)                           3254.5  5869.24
+  and+fma (2 ops, mixed int/fp)             4016.7  7243.90
+  vmovaps 64B load (L1, +addr)             19558.6 35272.47
+  LOAD16 = lo+hi (2 instr)                 16399.8 29575.93
+  vmovaps 64B store (L1, +addr)            19557.1 35269.78
+
+  (the "cycles" column is wrong: the clock calibration in this file was
+   optimised away, giving a nonsense 1803 GHz.  Use 1 cycle = 807.7 ps from
+   /proc/cpuinfo 1238.094 MHz.  The ps/op numbers are the measurement.)
+
+Read with the correct clock:
+  every register-only 512-bit ALU op = 1625-1630 ps = 2.01 cycles
+  vpaddd alone = 1015 ps because ICC collapsed `a += c; a += c` to `a += 2c`
+  memory benches are ~3 cycles per 64-byte line at L2 (buffer was 64 KB > the
+  32 KB L1), so they price L2 bandwidth, not the instructions.
+
+================================================================================
+SECTION 3 -- pq2prim3 1000000  (H1 issue-rate vs H2 memory-operand)
+================================================================================
+loop                                              ps/op   ps/iter
+  empty loop (overhead/iter)                     3254.8     3254.8
+  vfmadd, REGISTER operands, 8 chains            1627.2    13017.6
+  vfmadd, REGISTER operands, 16 chains          12095.3   193524.5   <- spills
+  vfmadd, MEMORY operand, 8 chains               1624.7    12997.6
+  vpsrld $2 (immediate only)                     1626.8    13014.3
+  vpermd, REGISTER operands                      1625.3    13002.2
+  vpaddd, REGISTER operands                      1627.1    13016.5
+  mix4: and+or+fma x4 (8 ops/iter)                813.8     6510.4
+  mix4p: 2*vpermd+fma x4 (12 ops/iter)            542.6     6511.8
+
+Disassembly counts (srccount.py on pq2prim3.s), per loop:
+  b_fma_reg   8 vfmadd213ps           -> 13017.6 ps / 8 = 1627 ps/op
+  b_permd_reg 8 vpermd                -> 13002.2 ps / 8 = 1625 ps/op
+  b_srli      8 vpsrld (immediate)    -> 13014.3 ps / 8 = 1627 ps/op
+  b_add_reg  14 vpaddd (8 in loop)    -> 13016.5 ps
+  b_mix4      4 vpandd + 4 vpord + 4 vfmadd231ps -> 6510.4 ps/iteration for 12 ops
+  b_mix4_perm 8 vpermd + 4 vfmadd231ps           -> 6511.8 ps/iteration for 12 ops
+
+CONCLUSION: vpermd, vpsrld, vpaddd, vpandd, vpord, vfmadd, vmulps all measure
+the SAME throughput, and a memory operand costs nothing extra.  H1 is
+supported, H2 is refuted.  On this part there is no "cheap op class": the only
+currency is the NUMBER of 512-bit vector operations.
+
+================================================================================
+SECTION 4 -- pq2v12 5120 512 5  (candidate + verification + first pricing)
+================================================================================
+(two runs of the same binary; first run then a rerun)
+
+=== element-wise vs V1: 64 source alignments x (128 unit vectors + row sum) ===
+  V10c (previous best)             MISMATCHES = 0  *** EXACT ***
+  V12  (scale-in-LUT + 2 LUTs)     MISMATCHES = 0  *** EXACT ***
+  V12b (scale-in-LUT only)         MISMATCHES = 0  *** EXACT ***
+  extra block 0 (8 alignments): V12 mismatches = 0, V12b = 0
+  extra block 1 (8 alignments): V12 mismatches = 0, V12b = 0
+  extra block 2 (8 alignments): V12 mismatches = 0, V12b = 0
+  extra block 3 (8 alignments): V12 mismatches = 0, V12b = 0
+multi-block check (4 rows x n=512): max rel diff V12 vs V1 = 0.000e+00 OK ;
+                                    V12 vs V10c = 0.000e+00
+
+=== pricing (one run, single thread, best of 5) ===
+  V1   shipped dequant+reload+FMA                     923.2 M weights/s  (1.000x)
+  V10c previous best (regrouped x, batch sched)      1059.2 M weights/s  (1.147x)
+  V12  scale-in-LUT + 2 LUTs (2 srli)                1228.3 M weights/s  (1.330x)
+  V12b scale-in-LUT only (6 srli, 1 LUT)             1171.3 M weights/s  (1.269x)
+  P_A  V12 with add instead of vpermd [WRONG]        1693.6 M weights/s  (1.834x)
+  P_B  V12 with no xp loads         [WRONG]          1208.5 M weights/s  (1.309x)
+  P_C  V12 with 1 LOAD16            [WRONG]          1485.4 M weights/s  (1.609x)
+  P_D  V12 with aligned loads       [WRONG]          1287.6 M weights/s  (1.395x)
+  P_E  no decode at all (floor)     [WRONG]          4894.8 M weights/s  (5.302x)
+sink=-213635
+
+(rerun, same binary)
+  V1   934.0 (1.000x)   V10c 1062.2 (1.137x)   V12 1215.9 (1.302x)   V12b 1170.5 (1.253x)
+  P_A 1707.4 (1.828x)   P_B 1208.2  P_C 1509.5  P_D 1282.3  P_E 4894.8
+
+P_A AND P_C ARE CONFOUNDED (this is why pq2v13 exists):
+  P_A also dropped the two LUT-scaling multiplies (it used the unscaled LUTs),
+  P_C also removed four permutes (it copied g[0..3] into g[4..7]).
+  Their deltas were therefore NOT "permute price" / "LOAD16 price".
+
+================================================================================
+SECTION 5 -- pq2v13 5120 512 5  (cost attribution, ONE change per probe)
+================================================================================
+variant                                           M w/s    ratio  cyc/block
+  V12  full candidate (reference)                1229.5    1.000      128.9
+  Q1   V12 with d=1.0f (no fp16 decode)          1691.4    1.376       93.7
+  Q10  V12 with a permuted vector scale          1559.7    1.269      101.6
+  Q2   V12 with 8 adds instead of 8 permd        1228.6    0.999      129.0
+  Q3   V12 with 4 permd + 4 adds                 1233.3    1.003      128.5
+  Q4   V12 with 1 LOAD16 (8 permd kept)          1273.2    1.036      124.5
+  Q5   V12 without the 2 LUT-scaling muls        1723.2    1.401       92.0
+  Q6   V12 without any shifts                    1412.4    1.149      112.2
+  Q7   V12 without the xp loads                  1337.9    1.088      118.4
+  Q8   8 permd + 8 FMA + 8 loads only            3127.6    2.544       50.7
+  Q9   8 FMA + 8 loads, no decode (floor)        4864.7    3.956       32.6
+
+  Q2 (8 vpermd -> 8 vpaddd) is IDENTICAL: vpermd is not expensive.
+  The expensive thing is the per-block dependency chain
+  load -> scalar fp16 decode -> broadcast -> 2 LUT muls -> permutes -> FMA.
+  Breaking it (Q1, Q5) is worth 1.38-1.40x.
+
+================================================================================
+SECTION 6 -- pq2v14 5120 512 5  (latency hiding; harness bug, see caveat)
+================================================================================
+  CAVEAT: pq2v14's VERIFICATION passed the raw x to kernels that expect the
+  permuted xp, so it reported 5696 mismatches for every variant including the
+  reference.  Its PRICING is valid (the raw kernels were priced with xp).
+  The verification was redone correctly in pq2v15/pq2v16.
+
+variant                                       M w/s    ratio  cyc/block
+  V12  (LUT-scaled, 1 block/iter)            1223.2    1.000      129.5
+  V14b (LUT-scaled, 2 blocks/iter)           1430.8    1.170      110.7
+  V14c (x-scaled, 1 block/iter)              1178.8    0.964      134.4
+  V14d (precomputed scales)                  1472.1    1.203      107.6
+  V14e (x-scaled + prescaled)                1394.0    1.140      113.7
+  V14f (x-scaled + 2 blocks)                 1278.0    1.045      124.0
+
+  Scaling the x operand instead of the LUT (V14c/V14e/V14f) is a LOSS:
+  8 multiplies on the x side cost more than 2 on the LUT side.
+
+================================================================================
+SECTION 7 -- pq2v15 5120 512 5  (K blocks in flight; wrong baseline, see note)
+================================================================================
+=== element-wise vs V1: 64 alignments x 129 checks ===
+  V12 / V15 K=1 / K=2 / K=3 / K=4 / K=5 / K=8   MISMATCHES = 0  *** EXACT ***
+=== 8 random-scale blocks x 8 alignments ===
+  all variants                                  MISMATCHES = 0  *** EXACT ***
+  multi-block (4 rows x n=512) max rel diff vs V1: all 0.00e+00
+
+=== pricing (one run, best of 5) ===
+  V1 (shipped)        718.3 M weights/s   1.000x vs V1      <- binary-layout artefact
+  V12                1460.9 M weights/s   2.034x vs V1
+  V15 K=1            1466.4 M weights/s   2.042x
+  V15 K=2            1316.0 M weights/s   1.832x
+  V15 K=3            1362.4 M weights/s   1.897x
+  V15 K=4            1373.7 M weights/s   1.913x
+  V15 K=5            1388.7 M weights/s   1.933x
+  V15 K=8            1426.6 M weights/s   1.986x
+
+  All K variants were measured in the SAME binary in the SAME run, so the
+  K comparison is valid: K>1 is WORSE than K=1.  The K=1 baseline itself is
+  inflated relative to pq2v12/pq2v14 (1461 vs 1216-1228 for identical source),
+  which is what motivated pq2v16.
+
+================================================================================
+SECTION 8 -- pq2v16 5120 512 5  (controlled: ONE binary, two pass orders)
+================================================================================
+=== element-wise vs V1: 64 alignments x 129 checks
+    + 8 finite-random scales x 8 alignments x 129 checks
+    + 10 edge-case scales (0, -0, min/max subnormal, min normal, max normal,
+      -2.0, 1.0, 0x007F, -max) x 8 alignments x 129 checks  ===
+  V10c               total checks = 26832, MISMATCHES = 0  *** EXACT ***
+  V12 inline         total checks = 26832, MISMATCHES = 0  *** EXACT ***
+  V12 helper         total checks = 26832, MISMATCHES = 0  *** EXACT ***
+  V12 inline+pre     total checks = 26832, MISMATCHES = 0  *** EXACT ***
+  V12 helper+pre     total checks = 26832, MISMATCHES = 0  *** EXACT ***
+
+=== pricing pass 1 (forward order, best of 5) ===
+  V1 shipped              936.9 M weights/s   1.000x vs V1
+  V10c                   1052.7 M weights/s   1.124x vs V1
+  V12 inline             1219.4 M weights/s   1.301x vs V1
+  V12 helper             1465.0 M weights/s   1.564x vs V1
+  V12 inline+pre         1465.0 M weights/s   1.564x vs V1
+  V12 helper+pre         1463.8 M weights/s   1.562x vs V1
+  V12 pf4                1078.6 M weights/s   1.151x vs V1
+  V12 pf8                1343.0 M weights/s   1.433x vs V1
+  V12 pf16               1377.5 M weights/s   1.470x vs V1
+  V12 pf32               1360.7 M weights/s   1.452x vs V1
+
+=== pricing pass 2 (REVERSE order, best of 5) ===
+  V1 shipped              940.7 M weights/s   1.000x vs V1
+  V10c                   1065.2 M weights/s   1.132x vs V1
+  V12 inline             1228.0 M weights/s   1.305x vs V1
+  V12 helper             1461.2 M weights/s   1.553x vs V1
+  V12 inline+pre         1461.6 M weights/s   1.554x vs V1
+  V12 helper+pre         1460.7 M weights/s   1.553x vs V1
+  V12 pf4                1047.6 M weights/s   1.114x vs V1
+  V12 pf8                1332.8 M weights/s   1.417x vs V1
+  V12 pf16               1359.5 M weights/s   1.445x vs V1
+  V12 pf32               1358.1 M weights/s   1.444x vs V1
+
+(an earlier run of the same binary, before the prefetch variants were added)
+  V1 934.8/939.2   V10c 1067.3/1066.6 (1.142/1.136x)
+  V12 inline 1232.4/1230.6 (1.318/1.310x)   V12 helper 1467.5/1461.7 (1.570/1.556x)
+  V12 inline+pre 1472.4/1456.5 (1.575/1.551x)  V12 helper+pre 1462.3/1450.1 (1.564/1.544x)
+
+CROSS-CHECK: V10c measures 1.124-1.154x here, against the previous agent's
+1.142-1.146x for the same kernel on the same card -- the methodology agrees.
+
+================================================================================
+SECTION 9 -- INSTRUCTIONS ACTUALLY EMITTED PER 128 WEIGHTS (srccount.py)
+================================================================================
+From `icc -mmic -O3 -S pq2v16.s`, grouped by the source line that produced them
+(pq2v16.s.counts.txt is generated by src/bonsai/srccount.py):
+
+V1 (shipped, pq2_0_dequant_block_imci inlined + 8 FMA, ICC unrolled the j loop
+by 2; the line-80 block below is therefore TWO blocks):
+  line 80: vpermd x32, vpsrlvd x16, vmulps x16, vloadunpackld x4,
+           vloadunpackhd x4, + scalar
+  lines 81-88: vfmadd132ps x4, vfmadd231ps x4, vmovaps x4, vmulps x4
+  => per 128 weights: 16 vpermd + 8 vpsrlvd + 8 vmulps + 8 vfmadd + 4 vmovaps
+     + 4 unpack-load instrs (+ 8 stores + 8 x loads which are folded into the
+     FMAs or the store)   == the previous agent's count (16 vpermd / 8 srlv /
+     8 mulps / 8 fmadd), reproduced here.
+
+V10c (pq2v16.s lines 106-133):
+  8 vpermd, 6 vpsrld, 8 vmulps, 8 vfmadd, 4 vmovaps, 4 unpack-load instrs,
+  2 vmovaps for the LOAD16 staging  => 40 in-loop instructions per 128 weights.
+
+V12 inline (lines 139-162): 8 vpermd, 2 vpsrld, 2 vmulps, 8 vfmadd,
+  4+2 vmovaps, 4 unpack  => 30 in-loop instructions per 128 weights.
+
+V12 helper (line 205, the whole inlined block body on one source line):
+  vpermd x8, vfmadd132ps x8, vmovaps x6, vloadunpackld x2, vloadunpackhd x2,
+  vpsrld x2, vmulps x2, vprefetch1 x1  => 31 in-loop instructions per 128 weights,
+  i.e. the same instruction mix as V12 inline but WITH a compiler-inserted
+  software prefetch (vprefetch1), which is what the explicit pf8..pf32 variants
+  confirm is worth ~10-13% of the 19% helper advantage.
+
+So: V12 removes 10 of V10c's 40 in-loop instructions (-25%) and adds one
+prefetch, and measures 1.55-1.56x vs V1 where V10c measures 1.12-1.15x.
+
+================================================================================
+SECTION 10 -- WHAT DID NOT WORK (negative results, all measured)
+================================================================================
+1. Replacing the LUT permute with integer arithmetic (V3, V7/V8/V9, and the
+   IEEE-754 "OR 0x4B000000 then subtract 2^23" bias idea).
+   pq2prim/pq2prim2/pq2prim3: a vpermd costs EXACTLY the same as a vpaddd, and
+   pq2v13 Q2: in the real kernel, replacing all 8 vpermd by 8 vpaddd changes
+   nothing (1228.6 vs 1229.5 M w/s).  Every such scheme needs >= 2 ops to
+   replace 1, so it can only lose.  The bias-float route also needs a per-lane
+   subtraction of 2^23 * x to avoid catastrophic cancellation (measured in the
+   doc's V3: 452 M w/s, 2.1x slower, and numerically wrong), so it is dead for
+   two independent reasons.
+2. Scaling the x operand instead of the LUT (pq2v14 V14c): 0.964x -- 8
+   multiplies on the x side cost more than 2 on the LUT side.
+3. Putting K>1 blocks in flight per iteration (pq2v15, same binary, same run):
+   K=2 1316, K=3 1362, K=4 1374, K=5 1389, K=8 1427 vs K=1 1466 M w/s.
+   Manual multi-block unrolling HURTS; register pressure and schedule length
+   outweigh the extra ILP.
+4. Explicit software prefetch is not a full substitute for the scheduling
+   difference: pf8/pf16/pf32 reach 1.42-1.47x where the helper form reaches
+   1.55-1.56x.  pf4 is worse than no prefetch at all (1.11-1.15x).
+5. The 8 broadcast permutes of the V1 decoder are NOT worth attacking by
+   instruction substitution: V10 already removed them by regrouping the dot
+   product by 2-bit field, which is the right way (it also removes the need for
+   a byte-wide broadcast, which the hardware cannot do at all -- see the
+   previous agent's exhaustive proof that 126 of 128 (half,group,lane) triples
+   admit no correct lane-local shift).
+
+================================================================================
+SECTION 11 -- SHAPE DEPENDENCE of the same pq2v16 binary
+================================================================================
+===== n=17408 (widest model tensor), d=64 =====   (summary tables only)
+  kernel                pass1    pass2
+  V1 shipped            1.000    1.000
+  V10c                  1.052    1.049
+  V12 inline            1.122    1.116
+  V12 helper            1.210    1.204
+  V12 inline+pre        1.268    1.265
+  V12 helper+pre        1.268    1.265
+  V12 pf4               1.186    1.182
+  V12 pf8               1.188    1.185
+  V12 pf16              1.186    1.182
+  V12 pf32              1.189    1.184
+  (V12 pf32 = 563.8 M weights/s, i.e. V1 itself is only ~476 M w/s here,
+   against 934 at n=5120 d=512 -- the shape is much slower for every kernel.)
+
+===== n=512 (short rows), d=512 =====
+  kernel                pass1    pass2
+  V1 shipped            1.000    1.000
+  V10c                  1.151    1.151
+  V12 inline            1.309    1.309
+  V12 helper            1.504    1.504
+  V12 inline+pre        1.428    1.428
+  V12 helper+pre        1.428    1.428
+  V12 pf4               1.402    1.402
+  V12 pf8               1.402    1.402
+  V12 pf16              1.402    1.402
+  V12 pf32              1.402    1.402
+
+At every shape the verification (26 832 checks) reported 0 mismatches, because
+the verification is shape-independent (one block at a time).
+

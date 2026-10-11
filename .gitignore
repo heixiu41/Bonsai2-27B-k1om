@@ -1,0 +1,18 @@
+# build artifacts / card binaries
+*.exe
+*.pdb
+*.obj
+*.o
+/bonsai_k1om*
+/pq2call
+/pq2f3batch
+/pq2scale
+/pq2ws
+/tf_new*
+
+# model files (7.2 GB, not part of the repo)
+*.gguf
+
+# OS noise
+Thumbs.db
+Desktop.ini
