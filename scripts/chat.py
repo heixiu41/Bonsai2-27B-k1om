@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import hashlib
 import os
 import re
 import struct
@@ -297,11 +298,148 @@ def _ssh_base(host: str) -> list:
             "-o", "StrictHostKeyChecking=no"]
 
 
+# The k1om OpenMP runtime the card-side chat binary links against.  PSXE 2017
+# ships it under the mic compiler lib dir; the MPSS sysroot does not have it,
+# and the card's tmpfs loses it on every boot.
+_MIC_OMP_LIB = (r"C:\Program Files (x86)\IntelSWTools"
+                r"\compilers_and_libraries_2017.0.109\windows\compiler"
+                r"\lib\intel64_win_mic\libiomp5.so")
+
+
+def _run_detached(argv, **kw):
+    """subprocess.run with the child detached from our stdin.
+
+    chat.py's stdin belongs to the conversation (a terminal, or a pipe when it
+    is driven by a script).  ssh forwards its stdin to the remote command, so
+    without this the upload helpers eat whatever the user typed next -- the
+    SCIF sink used to swallow the whole piped input, making a cold start look
+    like an immediate EOF."""
+    kw.setdefault("stdin", subprocess.DEVNULL)
+    return subprocess.run(argv, **kw)
+
+
+def _mic_runtime_libs() -> list:
+    """Local copies of the k1om shared libraries the card binary needs."""
+    cands = [os.environ.get("BONSAI_MIC_OMP_LIB"), _MIC_OMP_LIB]
+    return [p for p in cands if p and os.path.exists(p)]
+
+
+def _ensure_card_binary(host: str, base: list, local: str, remote: str) -> bool:
+    """Put a host binary on the card unless that exact build is already there.
+
+    The card is BusyBox with no sftp subsystem, so scp needs -O; a stale binary
+    left over from an earlier build is a far worse failure than a 1 s copy."""
+    if not os.path.exists(local):
+        return False
+    if _card_file_size(host, base, f"/tmp/{remote}") == os.path.getsize(local):
+        return True
+    r = _run_detached(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
+                       *base, local, f"{host}:/tmp/"])
+    if r.returncode != 0:
+        return False
+    _run_detached(["ssh", *base, host, f"chmod +x /tmp/{remote}"],
+                  capture_output=True)
+    return True
+
+
+def _card_file_size(host: str, base: list, path: str):
+    """Size of a file on the card, or None.
+
+    Both obvious probes are broken on this BusyBox: there is no `stat` at all,
+    and `wc -c` is 32-bit, so it reports the 7,206,168,928-byte model as
+    2,911,201,632 (= size mod 2^32).  `ls -l` prints the real 64-bit size."""
+    try:
+        r = _run_detached(["ssh", *base, host, f"ls -l {path} 2>/dev/null"],
+                          capture_output=True, text=True, timeout=60)
+        parts = r.stdout.split()
+        return int(parts[4]) if len(parts) >= 5 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _kill_card_sinks(host: str, base: list):
+    """A sink left behind by a failed attempt still holds port 20500, which
+    would make the next fallback layer fail for the wrong reason."""
+    try:
+        _run_detached(["ssh", *base, host,
+                        "killall scif_rma_sink scif_sink 2>/dev/null; true"],
+                       capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _md5_file(path: str, label: str) -> str:
+    """Streaming md5 with progress (~30 s for the 7.2 GB model on the host)."""
+    h = hashlib.md5()
+    total = os.path.getsize(path)
+    done = 0
+    t0 = time.time()
+    with open(path, "rb") as f:
+        while True:
+            blk = f.read(1 << 22)
+            if not blk:
+                break
+            h.update(blk)
+            done += len(blk)
+            pct = 100.0 * done / total if total else 100.0
+            print(f"\r  {label} md5 {pct:5.1f}% ({done / 1e9:.2f}/"
+                  f"{total / 1e9:.2f} GB)", end="", flush=True)
+    print(f"\r  {label} md5 done in {time.time() - t0:.0f} s" + " " * 24,
+          flush=True)
+    return h.hexdigest()
+
+
+def _card_md5(host: str, base: list, path: str) -> str:
+    """Whole-file md5 on the card.  BusyBox here has no sha256sum (only md5sum
+    and sha3sum), and it is scalar on 1.2 GHz cores, so this takes minutes."""
+    print("  card md5sum (no sha256sum in BusyBox; ~1-3 min for 7.2 GB) ...",
+          flush=True)
+    r = _run_detached(["ssh", *base, host, f"md5sum {path}"],
+                      capture_output=True, text=True, timeout=3600)
+    tok = r.stdout.split()
+    return tok[0] if tok else ""
+
+
+def _want_md5() -> bool:
+    return os.environ.get("BONSAI_VERIFY_MD5", "0").lower() not in \
+        ("", "0", "no", "false", "off")
+
+
+def _verify_card_model(host: str, base: list, gguf: str) -> bool:
+    """Opt-in whole-file md5 comparison (BONSAI_VERIFY_MD5=1, or --verify-md5).
+
+    Every transfer already checks a full-length rolling checksum card-side
+    against host-side, so this is belt-and-braces with a real cryptographic
+    hash: worth it when the card has been misbehaving, too slow for every
+    start."""
+    want = _md5_file(gguf, "host")
+    got = _card_md5(host, base, "/tmp/bonsai.gguf")
+    if want and want == got:
+        print(f"  md5 OK: {want}", flush=True)
+        return True
+    print(f"[fatal] md5 MISMATCH -- host={want} card={got}", file=sys.stderr)
+    return False
+
+
+def _model_ready(host: str, base: list, gguf: str) -> bool:
+    """Tail of ensure_card_files: the model is on the card."""
+    if _want_md5():
+        return _verify_card_model(host, base, gguf)
+    return True
+
+
 def ensure_card_files(host: str, gguf: str) -> bool:
     """Upload the chat binary and the model to the card if missing.
 
     The model is 7.2 GB and the card deletes it after every chat session
-    (see note in main()), so this is the normal per-session path."""
+    (see note in main()), so this is the normal per-session path.  The model
+    comes over SCIF, with three independent layers that must all keep working:
+    RMA (measured 357 MB/s) -> message SCIF (9-39 MB/s) -> scp (9-15 MB/s).
+
+    Set BONSAI_VERIFY_MD5=1 (or pass --verify-md5) to md5 the file on the card
+    and compare it with the local one after the upload.  Off by default: the
+    transfer's own full-length checksum already covers every byte, and the
+    card's scalar md5sum costs minutes."""
     base = _ssh_base(host)
     # The card reboots from time to time (tmpfs /tmp is wiped); its sshd
     # comes up well after the network stack, so a single 30 s probe can land
@@ -309,8 +447,9 @@ def ensure_card_files(host: str, gguf: str) -> bool:
     r = None
     for attempt in range(6):
         try:
-            r = subprocess.run(["ssh", *base, host,
-                                "ls /tmp/bonsai_k1om_chat /tmp/bonsai.gguf 2>/dev/null"],
+            r = _run_detached(["ssh", *base, host,
+                                "ls /tmp/bonsai_k1om_chat /tmp/libiomp5.so "
+                                "/tmp/bonsai.gguf 2>/dev/null"],
                                capture_output=True, text=True, timeout=35)
             break
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -327,102 +466,156 @@ def ensure_card_files(host: str, gguf: str) -> bool:
         local_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "bonsai_k1om_chat")
         print("uploading chat binary ...", flush=True)
-        r = subprocess.run(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
+        r = _run_detached(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
                             *base, local_bin, f"{host}:/tmp/"])
         if r.returncode != 0:
             print("[fatal] binary upload failed", file=sys.stderr)
             return False
-        subprocess.run(["ssh", *base, host, "chmod +x /tmp/bonsai_k1om_chat"],
+        _run_detached(["ssh", *base, host, "chmod +x /tmp/bonsai_k1om_chat"],
                        capture_output=True)
-    if "bonsai.gguf" not in have:
-        if not _upload_model_scif(host, base, gguf):
-            # SCIF's completion handshake can fail even when every byte
-            # landed on the card (e.g. the sink's ssh channel dropped after
-            # the last write). scp costs ~13 min, so verify size first.
-            try:
-                want = str(os.path.getsize(gguf))
-                chk = subprocess.run(
-                    ["ssh", *base, host,
-                     "stat -c %s /tmp/bonsai.gguf 2>/dev/null"],
-                    capture_output=True, text=True, timeout=30)
-                complete = chk.stdout.strip() == want
-            except (OSError, subprocess.TimeoutExpired):
-                complete = False
-            if complete:
-                print("SCIF handshake failed but the file is complete "
-                      "on the card -- skipping the scp fallback", flush=True)
-                return True
-            print("SCIF upload failed -- falling back to scp (~7-8 min)",
-                  flush=True)
-            t0 = time.time()
-            r = subprocess.run(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
-                                *base, gguf, f"{host}:/tmp/bonsai.gguf"])
-            if r.returncode != 0:
-                print("[fatal] model upload failed (card tmpfs full? "
-                      "it holds only 12.9 GB total)", file=sys.stderr)
+    if "libiomp5.so" not in have:
+        # The chat binary is an OpenMP build and the card has no libiomp5.so of
+        # its own, so a cold start must push it too -- previously this was a
+        # manual step and chat.py died with "error while loading shared
+        # libraries: libiomp5.so".
+        libs = _mic_runtime_libs()
+        if not libs:
+            print("[fatal] /tmp/libiomp5.so is missing on the card and no "
+                  "local copy was found (set BONSAI_MIC_OMP_LIB to the k1om "
+                  "libiomp5.so)", file=sys.stderr)
+            return False
+        for lib in libs:
+            if not _ensure_card_binary(host, base, lib, os.path.basename(lib)):
+                print(f"[fatal] could not upload {os.path.basename(lib)}",
+                      file=sys.stderr)
                 return False
-            print(f"model uploaded in {time.time() - t0:.0f} s", flush=True)
-    return True
+    if "bonsai.gguf" not in have:
+        layer = os.environ.get("BONSAI_TRANSFER_LAYER", "auto").lower()
+        if layer not in ("auto", "rma", "scif", "scp"):
+            layer = "auto"
+        _kill_card_sinks(host, base)
+
+        # Layer 1: SCIF RMA (~357 MB/s).  Layer 2: the message SCIF sink
+        # (9-39 MB/s).  Layer 3: scp (9-15 MB/s).  A forced layer disables the
+        # fallbacks so the verification harness can prove each one alone.
+        ok = False
+        if layer in ("auto", "rma"):
+            ok = _upload_model_rma(host, base, gguf)
+            if not ok and layer == "auto":
+                print("SCIF RMA upload failed -- falling back to the message "
+                      "SCIF sink", flush=True)
+                _kill_card_sinks(host, base)
+        if not ok and layer in ("auto", "scif"):
+            ok = _upload_model_scif(host, base, gguf)
+            if not ok and layer == "auto":
+                print("message SCIF upload failed -- falling back to scp",
+                      flush=True)
+        if ok:
+            return _model_ready(host, base, gguf)
+        if layer in ("rma", "scif"):
+            print(f"[fatal] BONSAI_TRANSFER_LAYER={layer}: that data path "
+                  f"failed and fallback is disabled", file=sys.stderr)
+            return False
+
+        # scp is both the last layer and the target of BONSAI_TRANSFER_LAYER=scp
+        if layer == "auto" and \
+                _card_file_size(host, base, "/tmp/bonsai.gguf") == \
+                os.path.getsize(gguf):
+            print("SCIF handshake failed but the file is complete "
+                  "on the card -- skipping the scp fallback", flush=True)
+            return _model_ready(host, base, gguf)
+        print("uploading over scp (~7-8 min for 7.2 GB) ...", flush=True)
+        t0 = time.time()
+        r = _run_detached(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
+                            *base, gguf, f"{host}:/tmp/bonsai.gguf"])
+        if r.returncode != 0:
+            print("[fatal] model upload failed (card tmpfs full? "
+                  "it holds only 12.9 GB total)", file=sys.stderr)
+            return False
+        print(f"model uploaded in {time.time() - t0:.0f} s (scp)", flush=True)
+    return _model_ready(host, base, gguf)
+
+
+def _scif_upload(host: str, base: list, sink_local: str, sink_remote: str,
+                 send_exe: str, gguf: str, label: str) -> bool:
+    """Shared orchestration for both SCIF data planes.
+
+    Deploy the card-side sink, start it over a background ssh, run the host
+    sender, then require BOTH sides to exit 0.  Any failure returns False so
+    the caller can fall through to the next layer."""
+    if not os.path.exists(send_exe):
+        print(f"[{label}] host sender {send_exe} is missing", flush=True)
+        return False
+    if not _ensure_card_binary(host, base, sink_local, sink_remote):
+        print(f"[{label}] could not deploy {sink_remote} to the card", flush=True)
+        return False
+
+    for attempt in (1, 2):
+        # the sink's own ssh channel has proven flaky: verify the launch and
+        # retry once before giving up to the next layer
+        sink = subprocess.Popen(
+            ["ssh", *base, host,
+             f"export LD_LIBRARY_PATH=/tmp && /tmp/{sink_remote}"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            # stderr inherited: sink errors must be visible
+        try:
+            time.sleep(2)
+            if sink.poll() is not None:
+                print(f"[{label}] attempt {attempt}: sink ssh died at "
+                      f"launch (rc={sink.returncode})", flush=True)
+                continue
+            r = _run_detached([send_exe, gguf, "bonsai.gguf"], timeout=1800)
+            sink_rc = sink.wait(timeout=300)
+            if r.returncode == 0 and sink_rc == 0:
+                return True
+            print(f"[{label}] attempt {attempt} failed "
+                  f"(send rc={r.returncode}, sink rc={sink_rc})", flush=True)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"[{label}] attempt {attempt} error: {e}", flush=True)
+        finally:
+            if sink.poll() is None:
+                sink.kill()
+        time.sleep(2)
+    return False
+
+
+def _upload_model_rma(host: str, base: list, gguf: str) -> bool:
+    """Model upload over SCIF registered-memory RMA (~357 MB/s measured).
+
+    The card registers a 256 MB ring window and the host DMAs whole slots into
+    it with scif_writeto, publishing progress with scif_fence_signal -- the
+    file never travels through the SCIF message path.  The sender also checks
+    the byte count and a full-file checksum the card computed over exactly what
+    it wrote, so a zero exit means the file is intact."""
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+    print("model not on the card -- uploading 7.2 GB over SCIF RMA "
+          "(~20 s, measured 357 MB/s) ...", flush=True)
+    t0 = time.time()
+    ok = _scif_upload(host, base,
+                      os.path.join(tools, "scif_rma_sink"), "scif_rma_sink",
+                      os.path.join(tools, "scif_rma_send.exe"), gguf, "scif-rma")
+    if ok:
+        print(f"model uploaded in {time.time() - t0:.0f} s (SCIF RMA)",
+              flush=True)
+    return ok
 
 
 def _upload_model_scif(host: str, base: list, gguf: str) -> bool:
-    """Model upload over SCIF (~39 MB/s, measured) instead of SSH (~15 MB/s).
+    """Model upload over the original message SCIF (9-39 MB/s measured).
 
-    Orchestration: make sure tools/scif_sink is on the card, start it via a
-    background ssh, then run tools/scif_send.exe on the host. Falls back by
-    returning False on any failure."""
+    Kept as the second layer: the host sends 16 MB scif_send messages that the
+    card-side sink turns into scif_recv + fwrite."""
     tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
-    sink_local = os.path.join(tools, "scif_sink")
-    send_exe = os.path.join(tools, "scif_send.exe")
-    if not (os.path.exists(sink_local) and os.path.exists(send_exe)):
-        return False
-    print("model not on the card -- uploading 7.2 GB over SCIF "
-          "(~3 min, measured 39 MB/s) ...", flush=True)
+    print("uploading 7.2 GB over the message SCIF sink "
+          "(measured 9-39 MB/s) ...", flush=True)
     t0 = time.time()
-    try:
-        # make sure the sink binary is present (tiny, scp is fine)
-        chk = subprocess.run(["ssh", *base, host,
-                              "test -x /tmp/scif_sink && echo yes"],
-                             capture_output=True, text=True, timeout=30)
-        if "yes" not in chk.stdout:
-            r = subprocess.run(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
-                                *base, sink_local, f"{host}:/tmp/"])
-            if r.returncode != 0:
-                return False
-            subprocess.run(["ssh", *base, host, "chmod +x /tmp/scif_sink"],
-                           capture_output=True)
-        for attempt in (1, 2):
-            # the sink's own ssh channel has proven flaky: verify the
-            # launch and retry the handshake once before giving up to scp
-            sink = subprocess.Popen(
-                ["ssh", *base, host,
-                 "export LD_LIBRARY_PATH=/tmp && /tmp/scif_sink"],
-                stdout=subprocess.DEVNULL)
-                # stderr inherited: sink errors must be visible
-            try:
-                time.sleep(2)
-                if sink.poll() is not None:
-                    print(f"[scif] attempt {attempt}: sink ssh died at "
-                          f"launch (rc={sink.returncode})", flush=True)
-                    continue
-                r = subprocess.run([send_exe, gguf, "bonsai.gguf"],
-                                   timeout=1800)
-                if r.returncode == 0 and sink.wait(timeout=300) == 0:
-                    print(f"model uploaded in {time.time() - t0:.0f} s "
-                          f"(SCIF)", flush=True)
-                    return True
-                print(f"[scif] attempt {attempt} failed "
-                      f"(send rc={r.returncode}, sink rc={sink.poll()})",
-                      flush=True)
-            except (OSError, subprocess.TimeoutExpired) as e:
-                print(f"[scif] attempt {attempt} error: {e}", flush=True)
-            finally:
-                if sink.poll() is None:
-                    sink.kill()
-            time.sleep(2)
-        return False
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    ok = _scif_upload(host, base,
+                      os.path.join(tools, "scif_sink"), "scif_sink",
+                      os.path.join(tools, "scif_send.exe"), gguf, "scif-msg")
+    if ok:
+        print(f"model uploaded in {time.time() - t0:.0f} s (message SCIF)",
+              flush=True)
+    return ok
 
 
 class CardClient:
@@ -697,7 +890,13 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default=SSH_HOST, help="ssh target")
     ap.add_argument("--max-tokens", type=int, default=MAX_NEW_TOKENS,
                     help="max tokens per reply (G <max>)")
+    ap.add_argument("--verify-md5", action="store_true",
+                    help="after the upload, md5 the model on the card and "
+                         "compare with the local file (slow: BusyBox md5sum "
+                         "is scalar on the card)")
     args = ap.parse_args(argv)
+    if args.verify_md5:
+        os.environ["BONSAI_VERIFY_MD5"] = "1"
 
     if args.selftest:
         return selftest(args)

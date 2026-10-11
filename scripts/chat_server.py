@@ -110,7 +110,8 @@ class LoadMonitor:
     def _remote_cleanup(self):
         try:
             subprocess.run(["ssh", *chat._ssh_base(self.host), self.host,
-                            self._KILLER], capture_output=True, timeout=15)
+                            self._KILLER], capture_output=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
         except Exception:
             pass
 
@@ -134,7 +135,10 @@ class LoadMonitor:
     # -- ssh plumbing ---------------------------------------------------------
     def _spawn(self, loop: str):
         cmd = ["ssh", *chat._ssh_base(self.host), self.host, loop]
+        # stdin=DEVNULL: an ssh child otherwise forwards (and consumes) the
+        # server's own stdin.
         return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, text=True,
                                 errors="replace", bufsize=1)
 

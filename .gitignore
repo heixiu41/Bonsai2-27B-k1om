@@ -10,6 +10,12 @@
 /pq2ws
 /tf_new*
 
+# diagnostic card binaries -- rebuild with: tools/build_rma.ps1 -Probe
+# (the *production* card sink tools/scif_rma_sink is tracked on purpose, the
+#  same way tools/scif_sink is: a fresh checkout can deploy it without icc)
+/tools/rma_probe_sink
+/tools/rma_flushbench
+
 # model files (7.2 GB, not part of the repo)
 *.gguf
 
