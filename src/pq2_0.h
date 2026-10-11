@@ -510,6 +510,76 @@ static inline void pq2_0_matvec_knc_xp(float *y, const float *xp,
     }
 }
 
+/* ------------------------------------------------------------------------
+ * drow-precompute variant (proven by the same-binary A/B in
+ * src/probes/pq2drow.c: BIT-IDENTICAL output vs pq2_0_matvec_knc_xp on all
+ * 5 real shapes at 1 and 244 threads; 1.142x at 244t, ~18.2 ms/token saved;
+ * full-model build ~73 ms; +~840 MB resident). The kernel above rebuilds
+ * every row's fp16 scale vector (pq2_build_drow) on EVERY matvec call; this
+ * variant reads a per-tensor table built once at model load.
+ *
+ * drows layout: row i's scales at drows + i * nblk_pad, with
+ * nblk_pad = (nblk + 15) & ~15 so every row base stays 64-byte aligned
+ * (pq2_build_drow's fast path uses _mm512_store_ps at drow + 16k). The pad
+ * matters: a 5120-wide tensor has nblk = 40 but nblk_pad = 48, so the table
+ * is d * nblk_pad floats, NOT d * nblk. Body lifted verbatim from the probe.
+ * ------------------------------------------------------------------------ */
+static inline void pq2_0_matvec_knc_xp_dpre(float *y, const float *xp,
+                                            const uint8_t *w, int n, int d,
+                                            const float *drows) {
+    const int nn = n;                       /* multiple of QK_PQ2_0 */
+    const size_t rb = ((size_t)n + QK_PQ2_0 - 1) / QK_PQ2_0 * PQ2_0_BLOCK_BYTES;
+    const __m512 l0b = pq2_lut_a(), l1b = pq2_lut_b();
+    const int nblk     = nn / QK_PQ2_0;
+    const int nblk_pad = (nblk + 15) & ~15;
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < d; ++i) {
+        const uint8_t *row = w + (size_t)i * rb;
+        __m512 s = _mm512_setzero_ps();
+        const uint8_t *blk = row;
+        const float *x0 = xp;
+        const float *dp = drows + (size_t)i * nblk_pad;
+        int b = nblk;
+        do {
+            const __m512 vd = _mm512_set1_ps(*dp);
+            const __m512i l0 = _mm512_castps_si512(_mm512_mul_ps(l0b, vd));
+            const __m512i l1 = _mm512_castps_si512(_mm512_mul_ps(l1b, vd));
+            const __m512i c0 = PQ2_IMCI_LOAD16(blk + 2);
+            const __m512i c1 = PQ2_IMCI_LOAD16(blk + 18);
+            const __m512i e0 = _mm512_srli_epi32(c0, 4);
+            const __m512i e1 = _mm512_srli_epi32(c1, 4);
+            __m512 t = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l0)), _mm512_load_ps(x0));
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l1)), _mm512_load_ps(x0 + 16), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l0)), _mm512_load_ps(x0 + 32), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l1)), _mm512_load_ps(x0 + 48), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l0)), _mm512_load_ps(x0 + 64), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l1)), _mm512_load_ps(x0 + 80), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l0)), _mm512_load_ps(x0 + 96), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l1)), _mm512_load_ps(x0 +112), t);
+            s = _mm512_add_ps(s, t);
+            blk += PQ2_0_BLOCK_BYTES;
+            x0  += QK_PQ2_0;
+            ++dp;
+        } while (--b);
+        y[i] = _mm512_reduce_add_ps(s);
+    }
+}
+
+/* One-time (per model load) builder: every row's drow, omp-parallel over
+ * rows, same builder the hot kernel uses per call. Thread-private: row i
+ * writes only its own drows[i*nblk_pad .. (i+1)*nblk_pad) slice.
+ * `row_bytes` is the packed row stride (nblk * PQ2_0_BLOCK_BYTES); `drows`
+ * must be 64-byte aligned and hold d * ((nblk + 15) & ~15) floats. */
+static inline void pq2_build_drows_mt(const uint8_t *w, size_t row_bytes,
+                                      int nblk, int d, float *drows) {
+    const int nblk_pad = (nblk + 15) & ~15;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < d; ++i)
+        pq2_build_drow(w + (size_t)i * row_bytes, nblk,
+                       drows + (size_t)i * nblk_pad);
+}
+
 static inline void pq2_0_matvec_knc(float *y, const float *x,
                                     const uint8_t *w, int n, int d) {
     const int nn = (n / QK_PQ2_0) * QK_PQ2_0;

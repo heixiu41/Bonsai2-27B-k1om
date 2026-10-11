@@ -77,6 +77,15 @@ typedef struct {
     uint64_t offset;        /* relative to gguf.data */
     uint64_t nbytes;        /* computed from type + dims */
     uint64_t n_elements;
+    /* k1om only: lazily-built per-row PQ2_0 fp16 scale table (the proven
+     * "drow precompute" from src/probes/pq2drow.c), dims[1] rows x
+     * round_up(dims[0]/128, 16) fp32, built on FIRST mm_run() per tensor
+     * (lazy, because at open time the 7.2 GB tmpfs model file still exists
+     * and the load peak would OOM the card) and owned/freed by model.c
+     * (aligned_f32). NULL on the host build / BONSAI_NO_DROW / before first
+     * use; the sentinel PQ2_DROWS_FAILED ((float*)1) marks a permanent
+     * allocation failure. Always NULL right after load (calloc). */
+    float   *drows;
 } bonsai_tensor;
 
 typedef struct {

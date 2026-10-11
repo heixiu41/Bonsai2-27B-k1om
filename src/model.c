@@ -290,6 +290,51 @@ static int mm_stage(bonsai_model *m, const float *x, const float *signs,
  * would otherwise be decoded with the PQ2_0 code map, producing garbage with
  * no error at all (dequant_to_f32() rejects it, but the mm path used not to
  * look). */
+
+#ifdef __MIC__
+/* Lazy per-tensor drow tables (proven bit-identical by src/probes/pq2drow.c,
+ * 1.142x at 244t, ~18.2 ms/token). LAZY, not load-time: bonsai_model_open()
+ * runs while the 7.2 GB tmpfs model file still exists (main_k1om.c unlinks
+ * only after open returns), so the load peak is tmpfs 7.2 + anon 7.7 GB and
+ * building +840 MB of tables inside open OOM-killed the card (dmesg
+ * confirmed). Built on first mm_run per tensor instead: by then the file is
+ * unlinked and ~7 GB is free. mm_run only ever runs on the master thread
+ * (the kernels open their own omp regions), so the write-back is race-free.
+ * BONSAI_NO_DROW disables; allocation failure is per-tensor and permanent
+ * (PQ2_DROWS_FAILED), falling back to the per-call builder. */
+#define PQ2_DROWS_FAILED ((float *)(uintptr_t)1)
+static int mm_drows_disabled = -1;      /* -1 unknown, 0 enabled, 1 disabled */
+static uint64_t mm_drows_bytes = 0;
+static int mm_drows_count = 0;
+
+static const float *mm_drows_for(bonsai_model *m, const bonsai_tensor *tc,
+                                 int n, int d) {
+    if (tc->drows == PQ2_DROWS_FAILED) return NULL;
+    if (tc->drows) return tc->drows;
+    if (mm_drows_disabled < 0)
+        mm_drows_disabled = getenv("BONSAI_NO_DROW") != NULL;
+    if (mm_drows_disabled) return NULL;
+    bonsai_tensor *t = (bonsai_tensor *)tc;   /* lazy cache write-back */
+    const int nblk     = n / QK_PQ2_0;
+    const int nblk_pad = (nblk + 15) & ~15;   /* 64 B row-base alignment */
+    const size_t rb    = (size_t)nblk * PQ2_0_BLOCK_BYTES;
+    float *dr = aligned_f32((size_t)nblk_pad * (size_t)d, 64);
+    if (!dr) {
+        fprintf(stderr, "model: drow allocation failed for %s (%d x %d) "
+                "-- per-call builder\n", t->name, nblk_pad, d);
+        t->drows = PQ2_DROWS_FAILED;
+        return NULL;
+    }
+    pq2_build_drows_mt(bonsai_tensor_data(m->g, t), rb, nblk, d, dr);
+    t->drows = dr;
+    mm_drows_bytes += (uint64_t)nblk_pad * (uint64_t)d * sizeof(float);
+    if ((++mm_drows_count & 127) == 0)
+        printf("drows: %d tensors, %.1f MB (lazy)\n", mm_drows_count,
+               (double)mm_drows_bytes / 1048576.0);
+    return dr;
+}
+#endif
+
 static int mm_run(bonsai_model *m, float *y, const char *wname, int n,
                   int d_cap) {
     const bonsai_tensor *t = T(m, wname);
@@ -315,7 +360,13 @@ static int mm_run(bonsai_model *m, float *y, const char *wname, int n,
     const int d = (int)t->dims[1];      /* ggml ne1 = output dim */
 
 #ifdef __MIC__
-    pq2_0_matvec_knc_xp(y, m->sc.fold_xp, w, n, d);
+    /* Precomputed drow table (built lazily on first use; bit-identical to
+     * the per-call builder, proven in src/probes/pq2drow.c). */
+    const float *dr = mm_drows_for(m, t, n, d);
+    if (dr)
+        pq2_0_matvec_knc_xp_dpre(y, m->sc.fold_xp, w, n, d, dr);
+    else
+        pq2_0_matvec_knc_xp(y, m->sc.fold_xp, w, n, d);
 #else
     pq2_0_matvec_ref(y, m->sc.fold_x, w, n, d);
 #endif
@@ -702,6 +753,12 @@ void bonsai_model_close(bonsai_model *m) {
     free(m->wc.attn_qn); free(m->wc.attn_kn);
     aligned_f32_free(m->signs_5120); aligned_f32_free(m->signs_6144);
     aligned_f32_free(m->signs_17408);
+    /* per-tensor drow tables (k1om only; NULL elsewhere, aligned_f32_free
+     * tolerates NULL). Must run before bonsai_gguf_free drops the table. */
+    if (m->g) {
+        for (uint64_t i = 0; i < m->g->tensor_len; ++i)
+            aligned_f32_free(m->g->tensors[i].drows);
+    }
     bonsai_gguf_free(m->g);    free(m);
 }
 
@@ -750,6 +807,20 @@ void bonsai_model_describe(const bonsai_model *m) {
     printf("  context allocated: %d\n", m->ctx);
     printf("  weights (PQ2_0, on disk) : %.2f GB\n",
            (double)m->g->file_size / 1e9);
+    {
+        /* upper bound for the lazily-built per-tensor drow tables (k1om
+         * only; built on first mm_run, after the tmpfs model is unlinked) */
+        uint64_t drb = 0;
+        for (uint64_t i = 0; i < m->g->tensor_len; ++i) {
+            const bonsai_tensor *t = &m->g->tensors[i];
+            if (t->type == GGML_TYPE_PQ2_0 && t->n_dims >= 2 &&
+                t->dims[0] % QK_PQ2_0 == 0)
+                drb += t->dims[1] *
+                       (((t->dims[0] / QK_PQ2_0) + 15) & ~(uint64_t)15) * 4;
+        }
+        printf("  drows (lazy, worst case)   : %.3f GB\n",
+               (double)drb / 1e9);
+    }
     printf("  runtime state + scratch  : %.3f GB\n",
            (double)bonsai_model_runtime_bytes(m) / 1e9);
 }

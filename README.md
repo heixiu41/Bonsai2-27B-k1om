@@ -8,7 +8,7 @@ Ternary Bonsai 2 27B（PrismML 的三值压缩模型，基于 Qwen3.8-27B）在 
 ```
 top-1 = 11751   official = 11751 (' Paris')   MATCH
 rank of 11751 = 0 / 248320
-性能: 3.499 tok/s decode (默认 244 线程)
+性能: 3.73 tok/s decode (默认 244 线程)
 对话: python scripts\chat.py   ← 纯 stdlib 分词器 + 卡上常驻服务，SCIF 传模型
 ```
 
@@ -47,10 +47,13 @@ rank of 11751 = 0 / 248320
              region/token，~8 ms）；attention 24 头并行（消唯一的 O(ctx) 串行段）
              rmsnorm 卡上双精度 8 路向量归约；rope 频率表缓存；
              argmax 向量化；OMP 预热挪进加载期（token 0: 0.72 → 0.33 s）
-             = 12.0x
+3.73         + drow 行缩放懒预计算：每张量首次 mm_run 时建好全行 fp16 缩放表
+             （内核循环不再逐行 gather+展开；探针同二进制 A/B 1.142x @244t，
+             逐位一致；+799 MB 常驻；懒建表避开加载内存峰值 OOM）
+             = 12.8x
 ```
 
-附：prefill 稳态 = decode（286 ms/token）；token 0 的一次性 OMP 预热
+附：prefill 稳态 = decode（268 ms/token）；token 0 的一次性 OMP 预热
 （~350 ms）已挪进模型加载期（预热后 token 0 = 0.33 s）。
 
 **验收**：宿主回归 `ALL CHECKS PASSED`（5 个阶段检查 + 4 个隐藏状态地标，exit 0），
@@ -217,7 +220,7 @@ fork 源码     D:\llama-prism-src\llama.cpp-prism\
 
 | 项 | 状态 |
 |---|---|
-| **性能** | 3.499 tok/s decode。matvec 内核 ~65%（已处于 shape 混合后的满速），剩余杠杆：drow 加载时预计算（+848 MB 常驻，需内存评估）、块内 rescale 变体（1e-7 级漂移）、prefill 输出头跳过 |
+| **性能** | 3.73 tok/s decode。matvec 内核 ~63%（已处于 shape 混合后的满速），drow 懒预计算已落地（+799 MB 常驻，逐位一致），剩余杠杆：块内 rescale 变体（0-19 ms，1e-7 级漂移，需 A/B）、prefill 输出头跳过（~5% prefill）、vexp223ps 向量化 exp（<0.5 ms） |
 | **C 版分词器** | ✅ 已有 Python 纯 stdlib 版（`scripts/chat.py`，含 chat template 与流式解码）；C 版仍未做 |
 | **COI 缓冲映射** | 未做 —— 完成可省掉模型上传并腾出 6.8 GB 卡内存 |
 | **长上下文** | `pos > 5` / `ctx > 256` 未测试 |
