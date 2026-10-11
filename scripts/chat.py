@@ -379,24 +379,38 @@ def _upload_model_scif(host: str, base: list, gguf: str) -> bool:
                 return False
             subprocess.run(["ssh", *base, host, "chmod +x /tmp/scif_sink"],
                            capture_output=True)
-        sink = subprocess.Popen(["ssh", *base, host,
-                                 "export LD_LIBRARY_PATH=/tmp && /tmp/scif_sink"],
-                                stdout=subprocess.DEVNULL)
-                                # stderr inherited: sink errors must be visible
-        try:
-            r = subprocess.run([send_exe, gguf, "bonsai.gguf"], timeout=1800)
-            if r.returncode != 0:
-                return False
-            rc = sink.wait(timeout=300)          # sink exits after the file
-            if rc != 0:
-                return False
-        finally:
-            if sink.poll() is None:
-                sink.kill()
+        for attempt in (1, 2):
+            # the sink's own ssh channel has proven flaky: verify the
+            # launch and retry the handshake once before giving up to scp
+            sink = subprocess.Popen(
+                ["ssh", *base, host,
+                 "export LD_LIBRARY_PATH=/tmp && /tmp/scif_sink"],
+                stdout=subprocess.DEVNULL)
+                # stderr inherited: sink errors must be visible
+            try:
+                time.sleep(2)
+                if sink.poll() is not None:
+                    print(f"[scif] attempt {attempt}: sink ssh died at "
+                          f"launch (rc={sink.returncode})", flush=True)
+                    continue
+                r = subprocess.run([send_exe, gguf, "bonsai.gguf"],
+                                   timeout=1800)
+                if r.returncode == 0 and sink.wait(timeout=300) == 0:
+                    print(f"model uploaded in {time.time() - t0:.0f} s "
+                          f"(SCIF)", flush=True)
+                    return True
+                print(f"[scif] attempt {attempt} failed "
+                      f"(send rc={r.returncode}, sink rc={sink.poll()})",
+                      flush=True)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print(f"[scif] attempt {attempt} error: {e}", flush=True)
+            finally:
+                if sink.poll() is None:
+                    sink.kill()
+            time.sleep(2)
+        return False
     except (OSError, subprocess.TimeoutExpired):
         return False
-    print(f"model uploaded in {time.time() - t0:.0f} s (SCIF)", flush=True)
-    return True
 
 
 class CardClient:
