@@ -71,8 +71,19 @@ CTX_LEN = 8192
 #                       sampled at 0.5 Hz only while idle.
 # ---------------------------------------------------------------------------
 class LoadMonitor:
-    MEM_LOOP = "while :; do cat /proc/meminfo; sleep 1; done"
-    CPU_LOOP = "while :; do cat /proc/stat; sleep 2; done"
+    # `|| exit` is load-bearing: when the ssh channel dies (local kill,
+    # network drop), the remote cat dies on SIGPIPE and the loop EXITS.
+    # Without it the shell loop survives forever on the card (observed:
+    # 5 leaked loops at 1 Hz -> decode 3.4 -> 0.8 tok/s). BusyBox pkill
+    # has no working -f, so cleanup greps /proc/*/cmdline for the tag.
+    MEM_LOOP = ("while :; do cat /proc/meminfo || exit; sleep 1; done"
+                " # loadmon_mem")
+    CPU_LOOP = ("while :; do cat /proc/stat || exit; sleep 2; done"
+                " # loadmon_cpu")
+    _KILLER = ("for f in /proc/[0-9]*/cmdline; do "
+               "grep -q loadmon_ $f 2>/dev/null || continue; "
+               "p=${f#/proc/}; kill ${p%/cmdline} 2>/dev/null; "
+               "done")
 
     def __init__(self, host: str):
         self.host = host
@@ -94,6 +105,14 @@ class LoadMonitor:
                     p.kill()
                 except OSError:
                     pass
+        self._remote_cleanup()           # belt: sweep any leaked loops
+
+    def _remote_cleanup(self):
+        try:
+            subprocess.run(["ssh", *chat._ssh_base(self.host), self.host,
+                            self._KILLER], capture_output=True, timeout=15)
+        except Exception:
+            pass
 
     # -- cpu sampling suspension (called by the turn worker) -----------------
     def suspend_cpu(self):
@@ -102,7 +121,7 @@ class LoadMonitor:
         self.cpu_proc = None
         if p is not None:
             try:
-                p.kill()               # remote loop dies on closed channel
+                p.kill()               # channel death -> remote `|| exit`
             except OSError:
                 pass
         self.last["cpu"] = None
