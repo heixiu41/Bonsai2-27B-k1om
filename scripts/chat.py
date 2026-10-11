@@ -324,6 +324,22 @@ def ensure_card_files(host: str, gguf: str) -> bool:
                        capture_output=True)
     if "bonsai.gguf" not in have:
         if not _upload_model_scif(host, base, gguf):
+            # SCIF's completion handshake can fail even when every byte
+            # landed on the card (e.g. the sink's ssh channel dropped after
+            # the last write). scp costs ~13 min, so verify size first.
+            try:
+                want = str(os.path.getsize(gguf))
+                chk = subprocess.run(
+                    ["ssh", *base, host,
+                     "stat -c %s /tmp/bonsai.gguf 2>/dev/null"],
+                    capture_output=True, text=True, timeout=30)
+                complete = chk.stdout.strip() == want
+            except (OSError, subprocess.TimeoutExpired):
+                complete = False
+            if complete:
+                print("SCIF handshake failed but the file is complete "
+                      "on the card -- skipping the scp fallback", flush=True)
+                return True
             print("SCIF upload failed -- falling back to scp (~7-8 min)",
                   flush=True)
             t0 = time.time()
@@ -365,8 +381,8 @@ def _upload_model_scif(host: str, base: list, gguf: str) -> bool:
                            capture_output=True)
         sink = subprocess.Popen(["ssh", *base, host,
                                  "export LD_LIBRARY_PATH=/tmp && /tmp/scif_sink"],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL)
+                                # stderr inherited: sink errors must be visible
         try:
             r = subprocess.run([send_exe, gguf, "bonsai.gguf"], timeout=1800)
             if r.returncode != 0:
