@@ -333,8 +333,11 @@ def _ensure_card_binary(host: str, base: list, local: str, remote: str) -> bool:
         return False
     if _card_file_size(host, base, f"/tmp/{remote}") == os.path.getsize(local):
         return True
+    # scp to the *remote* name explicitly: with a bare "host:/tmp/" target scp
+    # keeps the local basename, so `remote` would be a lie whenever the two
+    # differ (and only the size check would ever notice).
     r = _run_detached(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
-                       *base, local, f"{host}:/tmp/"])
+                       *base, local, f"{host}:/tmp/{remote}"])
     if r.returncode != 0:
         return False
     _run_detached(["ssh", *base, host, f"chmod +x /tmp/{remote}"],
