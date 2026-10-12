@@ -308,7 +308,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>Bonsai-2 27B <span class="sub">· Xeon Phi k1om 推理卡 · ~3.4 tok/s</span></h1>
+  <h1>Bonsai-2 27B <span class="sub">· Xeon Phi k1om 推理卡 · ~3.7 tok/s</span></h1>
   <div id="statusbar">
     <span><span id="conn-dot" class="wait"></span><b id="st-conn">连接中…</b></span>
     <span>速度 <b id="st-speed">–</b> tok/s</span>
@@ -322,6 +322,9 @@ PAGE = r"""<!DOCTYPE html>
 <div id="inputbar">
   <div class="row">
     <textarea id="input" rows="1" placeholder="输入消息… (Enter 发送, Shift+Enter 换行)"></textarea>
+    <input id="temp" type="number" min="0" max="5" step="0.1" value="0"
+           title="温度:0 = 贪婪(确定性,默认);0.3-0.8 较自然;>1 越发散。采样在卡上完成,代价 <0.5%"
+           style="width:64px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:0 6px;">
     <button id="send" disabled>发送</button>
     <button id="reset" title="清空对话并重置卡片上下文">重置</button>
   </div>
@@ -434,7 +437,7 @@ async function send() {
     const r = await fetch("/api/send", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({text})
+      body: JSON.stringify({text, temperature: parseFloat(document.getElementById("temp").value) || 0})
     });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
@@ -563,8 +566,11 @@ class WebCardClient(CardClient):
     protocol as chat.py's generate(), but tokens go to the SSE queue)."""
 
     def generate_events(self, tok: Tokenizer, max_new: int,
-                        pos0: int, total0: int):
-        self._send(f"G {max_new}")
+                        pos0: int, total0: int, temperature: float = 0.0):
+        if temperature and temperature > 0:
+            self._send(f"G {max_new} {temperature:g}")
+        else:
+            self._send(f"G {max_new}")
         dec = StreamDecoder(tok)
         ids = []
         t0 = time.time()
@@ -593,7 +599,7 @@ class WebCardClient(CardClient):
         return ids, tail, (len(ids) / dt if dt > 0 else 0.0)
 
 
-def run_turn(text: str):
+def run_turn(text: str, temperature: float = 0.0):
     """One full user turn. Called in a worker thread with turn_lock held."""
     tok, client = STATE.tok, STATE.client
     total0 = STATE.total_gen
@@ -614,7 +620,7 @@ def run_turn(text: str):
 
         publish("thinking", {"stage": "generate"})
         gen_ids, tail, rate = client.generate_events(
-            tok, MAX_NEW_TOKENS, pos0, total0)
+            tok, MAX_NEW_TOKENS, pos0, total0, temperature)
         if tail:
             publish("token", {"text": tail, "tok_s": rate,
                               "total": total0 + len(gen_ids),
@@ -728,17 +734,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_send(self):
         try:
-            text = str(self._read_json().get("text", "")).strip()
+            body = self._read_json()
+            text = str(body.get("text", "")).strip()
         except (ValueError, UnicodeDecodeError):
             return self._send_json(400, {"error": "bad JSON body"})
         if not text:
             return self._send_json(400, {"error": "empty text"})
+        try:
+            temperature = float(body.get("temperature", 0) or 0)
+        except (TypeError, ValueError):
+            temperature = 0.0
+        temperature = min(max(temperature, 0.0), 5.0)   # 0 = greedy
         if not STATE.alive:
             return self._send_json(503, {"error": "卡片未连接"})
         if not STATE.turn_lock.acquire(blocking=False):
             return self._send_json(409, {"error": "上一轮还在生成中,请稍候"})
         # lock is released by the worker (run_turn's finally)
-        threading.Thread(target=run_turn, args=(text,), daemon=True).start()
+        threading.Thread(target=run_turn, args=(text, temperature),
+                         daemon=True).start()
         self._send_json(200, {"ok": True})
 
     def _api_reset(self):

@@ -207,4 +207,10 @@ int bonsai_generate(bonsai_model *m, const int32_t *prompt, int32_t n_prompt,
  * k1om, scalar elsewhere. */
 int32_t bonsai_argmax(const float *x, int32_t n);
 
+/* Temperature sampling: softmax(logits / temp) + one xorshift64* draw.
+ * DESTROYS the logits buffer (overwritten with unnormalised probabilities).
+ * temp <= 1e-5 falls back to bonsai_argmax. rng is the PRNG state (nonzero). */
+int32_t bonsai_sample_temp(float *logits, int32_t n, float temp,
+                           uint64_t *rng);
+
 #endif /* BONSAI_MODEL_H */

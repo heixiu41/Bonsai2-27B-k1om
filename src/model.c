@@ -1501,3 +1501,43 @@ int32_t bonsai_argmax(const float *x, int32_t n) {
         return best;
     }
 }
+
+/* Temperature sampling over the logits: softmax(logits / temp) then one
+ * xorshift64* draw. DESTROYS the logits buffer (overwritten with unnormalised
+ * probabilities) -- every caller recomputes logits per token, so this is safe.
+ *
+ * Cost on the card: ~1-1.5 ms/token (< 0.5% of a 268 ms token). icc's default
+ * -fp-model=fast plus SVML vectorise the expf pass (16-wide); the cumulative
+ * pick is a serial early-exit scan (~half the vocab on average). Ties and
+ * distribution exactness do NOT matter here (this is a sampling path, not a
+ * correctness gate); the greedy path stays in bonsai_argmax, untouched.
+ * rng must point to a nonzero xorshift64* state. */
+int32_t bonsai_sample_temp(float *logits, int32_t n, float temp,
+                           uint64_t *rng) {
+    if (temp <= 1e-5f) return bonsai_argmax(logits, n);
+    float mx = logits[0];
+    for (int32_t i = 1; i < n; ++i)
+        if (logits[i] > mx) mx = logits[i];
+    const float inv_t = 1.0f / temp;
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; ++i) {
+        const float p = expf((logits[i] - mx) * inv_t);
+        logits[i] = p;
+        sum += (double)p;
+    }
+    if (!(sum > 0.0)) {                    /* all-underflow pathological case */
+        return bonsai_argmax(logits, n);   /* (logits now hold p; argmax of p
+                                              * == argmax of logits anyway) */
+    }
+    uint64_t s = *rng;
+    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+    *rng = s;
+    const double r = (double)((s * 2685821657736338717ULL) >> 40) *
+                     (1.0 / 16777216.0) * sum;
+    double acc = 0.0;
+    for (int32_t i = 0; i < n; ++i) {
+        acc += (double)logits[i];
+        if (acc >= r) return i;
+    }
+    return n - 1;
+}

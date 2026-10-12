@@ -698,10 +698,15 @@ class CardClient:
             print(f"[prefill] prompt ingested in {time.time() - t0:.1f} s",
                   flush=True)
 
-    def generate(self, tok: Tokenizer, max_new: int) -> list[int]:
+    def generate(self, tok: Tokenizer, max_new: int,
+                 temperature: float = 0.0) -> list[int]:
         """Stream a reply. Returns the emitted token ids (incl. a trailing
-        EOS if the model stopped on its own)."""
-        self._send(f"G {max_new}")
+        EOS if the model stopped on its own). temperature > 0 switches the
+        card from greedy argmax to softmax(logits/T) sampling."""
+        if temperature and temperature > 0:
+            self._send(f"G {max_new} {temperature:g}")
+        else:
+            self._send(f"G {max_new}")
         dec = StreamDecoder(tok)
         ids = []
         t0 = time.time()

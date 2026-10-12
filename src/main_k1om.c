@@ -55,9 +55,11 @@ static void usage(const char *argv0) {
  *   E <id>      set the EOS token id (generation stops after emitting it)
  *   R           reset all recurrent state and position; replies "OK"
  *   P <id...>   ingest prompt tokens at consecutive positions; replies "OK"
- *   G <max>     greedy-generate up to <max> tokens; prints one "<id>" line
+ *   G <max> [T] generate up to <max> tokens; prints one "<id>" line
  *               per token as produced, then "END <n>". Also stops at EOS
- *               (if set) or when the context is full.
+ *               (if set) or when the context is full. Optional T > 0
+ *               enables temperature sampling (softmax over logits/T);
+ *               absent or <= 0 keeps the deterministic greedy argmax.
  * Unknown lines get "ERR <line>". The model loads ONCE at startup; the
  * caller keeps the pipe open for the whole chat session. */
 #define CHAT_CTX 8192
@@ -75,6 +77,8 @@ static int chat_mode(bonsai_model *m) {
     int32_t pos = 0;
     int32_t eos = -1;
     int32_t ntok_max = 1024 * 1024;      /* sanity bound per command */
+    uint64_t rng = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^
+                   0x9E3779B97F4A7C15ULL;   /* xorshift64* state for G <n> T */
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("READY\n");
@@ -125,11 +129,24 @@ static int chat_mode(bonsai_model *m) {
             }
             printf(fail ? "ERR prompt (code %d)\n" : "OK\n", fail);
         } else if (cmd == 'G') {
-            const long max = strtol(p, NULL, 10);
+            char *end = NULL;
+            const long max = strtol(p, &end, 10);
+            /* optional temperature: "G 64 0.8". Absent/<=0 -> greedy. */
+            float temp = 0.0f;
+            if (end) {
+                while (*end == ' ' || *end == '\t') ++end;
+                if (*end && *end != '\n' && *end != '\r') {
+                    const double t = strtod(end, NULL);
+                    if (t > 0) temp = (float)t;
+                }
+            }
             long made = 0;
             while (made < max && pos < m->ctx) {
-                /* greedy argmax over the logits of the last forward */
-                const int32_t best = bonsai_argmax(m->sc.logits, m->n_vocab);
+                /* greedy argmax (T absent) or temperature sample (T > 0)
+                 * over the logits of the last forward */
+                const int32_t best = (temp > 0.0f)
+                    ? bonsai_sample_temp(m->sc.logits, m->n_vocab, temp, &rng)
+                    : bonsai_argmax(m->sc.logits, m->n_vocab);
                 printf("%d\n", best);
                 ++made;
                 if (best == eos) break;
