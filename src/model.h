@@ -43,7 +43,10 @@ typedef struct {
     /* GDN: causal conv history, (kernel-1) previous QKV vectors */
     float *conv_hist;          /* [n_layer][conv_k-1][conv_dim] */
 
-    /* full attention: KV cache, [n_layer][ctx][2][n_head_kv][head_dim] */
+    /* full attention ONLY: KV cache, [n_attn][ctx][2][n_head_kv][head_dim].
+     * Compacted on purpose -- the n_layer-n_attn GDN blocks are linear
+     * attention and never touch it, so the old n_layer stride wasted 4x here
+     * (3 GiB at ctx=8192).  Index it with model.c:attn_slot(m, il). */
     float *kv_cache;
     int32_t kv_len;            /* tokens currently cached */
 } bonsai_state;
@@ -133,6 +136,9 @@ typedef struct {
     int32_t key_dim, value_dim, conv_dim, head_v_dim;
 
     int32_t full_attn_interval;
+    int32_t n_attn;              /* full-attention blocks = layers with
+                                  * (il+1) % full_attn_interval == 0; the other
+                                  * n_layer-n_attn are GDN (linear) blocks */
     int32_t had_block;
     float   rms_eps;
     double  rope_freq_base;

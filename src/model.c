@@ -559,6 +559,19 @@ bonsai_model *bonsai_model_open(const char *gguf_path, int32_t ctx) {
     m->value_dim  = (int32_t)g_value_dim;         /* 6144 */
     m->conv_dim   = (int32_t)g_conv_dim;          /* 10240 */
     m->head_v_dim = (int32_t)(g_value_dim / dtr); /* 128, dtr > 0 (checked) */
+
+    /* How many blocks are full attention (the rest are GDN / linear). The KV
+     * cache is sized and indexed by this, not by n_layer: only these blocks
+     * ever touch it, and n_layer would over-allocate 4x here (64 vs 16). */
+    m->n_attn = 0;
+    for (int il = 0; il < m->n_layer; ++il)
+        if ((il + 1) % m->full_attn_interval == 0) ++m->n_attn;
+    if (m->n_attn <= 0) {
+        fprintf(stderr, "model: no full-attention block in %d layers "
+                        "(interval %d)\n", m->n_layer, m->full_attn_interval);
+        bonsai_model_close(m);
+        return NULL;
+    }
     /* context: default to something that fits comfortably (the reference caps
      * at 2048 on this hardware class). */
     if (ctx <= 0) ctx = 2048;
@@ -610,8 +623,9 @@ bonsai_model *bonsai_model_open(const char *gguf_path, int32_t ctx) {
                                       m->ssm_d_state, sizeof(float));
     m->st.conv_hist = (float *)calloc(L * (m->ssm_d_conv - 1) * m->conv_dim,
                                       sizeof(float));
-    m->st.kv_cache  = (float *)calloc(L * (size_t)ctx * 2 * m->n_head_kv *
-                                      m->head_dim, sizeof(float));
+    m->st.kv_cache  = (float *)calloc((size_t)m->n_attn * (size_t)ctx * 2 *
+                                      m->n_head_kv * m->head_dim,
+                                      sizeof(float));
     m->st.kv_len = 0;
 
     bonsai_scratch *s = &m->sc;
@@ -678,9 +692,7 @@ bonsai_model *bonsai_model_open(const char *gguf_path, int32_t ctx) {
      * once (~110 MB): the per-token dequant_to_f32() calls in the block
      * functions used to redo this work every token (~85 ms/token on the card
      * for the ssm_beta/ssm_alpha pair alone). */
-    int n_attn = 0;
-    for (int il = 0; il < m->n_layer; ++il)
-        if ((il + 1) % m->full_attn_interval == 0) ++n_attn;
+    int n_attn = m->n_attn;                 /* computed once above */
     const int n_gdn = m->n_layer - n_attn;
 
     bonsai_wcache *wc = &m->wc;
@@ -766,7 +778,7 @@ uint64_t bonsai_model_runtime_bytes(const bonsai_model *m) {
     uint64_t b = 0;
     b += (uint64_t)m->n_layer * m->ssm_dt_rank * m->ssm_d_state * m->ssm_d_state * 4;
     b += (uint64_t)m->n_layer * (m->ssm_d_conv - 1) * m->conv_dim * 4;
-    b += (uint64_t)m->n_layer * m->ctx * 2 * m->n_head_kv * m->head_dim * 4;
+    b += (uint64_t)m->n_attn * m->ctx * 2 * m->n_head_kv * m->head_dim * 4;
     b += (uint64_t)m->n_embd * 3 * 4;
     b += (uint64_t)m->conv_dim * 2 * 4;
     b += (uint64_t)m->value_dim * 2 * 4;
@@ -779,9 +791,7 @@ uint64_t bonsai_model_runtime_bytes(const bonsai_model *m) {
     b += 17408u * 4;      /* fold_xp */
     b += 5120u * 4 + 6144u * 4 + 17408u * 4;
     /* token-invariant weight cache (model.h: bonsai_wcache) */
-    uint64_t n_attn = 0;
-    for (int il = 0; il < m->n_layer; ++il)
-        if ((il + 1) % m->full_attn_interval == 0) ++n_attn;
+    uint64_t n_attn = (uint64_t)m->n_attn;
     const uint64_t n_gdn = (uint64_t)m->n_layer - n_attn;
     b += (uint64_t)m->n_layer * m->n_embd * 2 * 4;       /* attn/post norms */
     b += (uint64_t)m->n_embd * 4;                        /* output_norm */
@@ -831,8 +841,8 @@ void bonsai_reset(bonsai_model *m) {
                                m->ssm_d_state * sizeof(float));
     memset(m->st.conv_hist, 0, L * (m->ssm_d_conv - 1) * m->conv_dim *
                                sizeof(float));
-    memset(m->st.kv_cache, 0, L * (size_t)m->ctx * 2 * m->n_head_kv *
-                              m->head_dim * sizeof(float));
+    memset(m->st.kv_cache, 0, (size_t)m->n_attn * (size_t)m->ctx * 2 *
+                              m->n_head_kv * m->head_dim * sizeof(float));
     m->st.kv_len = 0;
 }
 
@@ -1130,7 +1140,9 @@ static int block_attn(bonsai_model *m, int il, int pos) {
     const float *rope_cos = s->rope_cos, *rope_sin = s->rope_sin;
     const int nhalf = m->n_rot / 2;
     const int t = m->st.kv_len;
-    float *kc = m->st.kv_cache + ((size_t)il * m->ctx + t) * 2 * nkv * hd;
+    /* Compacted KV: this block owns row attn_slot(m, il) == aslot, not il
+     * (see model.h), because the GDN blocks never touch the cache. */
+    float *kc = m->st.kv_cache + (aslot * m->ctx + (size_t)t) * 2 * nkv * hd;
     float *vc = kc + (size_t)nkv * hd;
     const int nt = t + 1;
     const float inv_sqrt_hd = 1.0f / sqrtf((float)hd);
@@ -1192,7 +1204,7 @@ static int block_attn(bonsai_model *m, int il, int pos) {
             float mx = -INFINITY;
             for (int p = 0; p < nt; ++p) {
                 const float *kp = m->st.kv_cache +
-                    ((size_t)il * m->ctx + p) * 2 * nkv * hd + (size_t)hkv * hd;
+                    (aslot * m->ctx + (size_t)p) * 2 * nkv * hd + (size_t)hkv * hd;
                 float acc = 0.0f;
                 for (int d = 0; d < hd; ++d) acc += qh[d] * kp[d];
                 acc *= inv_sqrt_hd;
@@ -1207,7 +1219,7 @@ static int block_attn(bonsai_model *m, int il, int pos) {
             for (int p = 0; p < nt; ++p) {
                 const float w = sc[p] * inv;
                 const float *vp = m->st.kv_cache +
-                    ((size_t)il * m->ctx + p) * 2 * nkv * hd + (size_t)nkv * hd +
+                    (aslot * m->ctx + (size_t)p) * 2 * nkv * hd + (size_t)nkv * hd +
                     (size_t)hkv * hd;
                 for (int d = 0; d < hd; ++d) oh[d] += w * vp[d];
             }
