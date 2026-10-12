@@ -86,6 +86,13 @@ typedef struct {
      * use; the sentinel PQ2_DROWS_FAILED ((float*)1) marks a permanent
      * allocation failure. Always NULL right after load (calloc). */
     float   *drows;
+    /* k1om only: 1 once this tensor's rows were compressed IN PLACE from the
+     * 34-byte PQ2_0 block stride to the 32-byte codes-only stride (see
+     * pq2_0.h:pq2_repack_rows_inplace).  Set at the same lazy moment as
+     * `drows`, because the repack drops the fp16 scale bytes that drows are
+     * built from -- drows first, then compress.  Always 0 right after load
+     * (calloc), and always 0 on the host build / under BONSAI_NO_DROW. */
+    int      packed;
 } bonsai_tensor;
 
 typedef struct {

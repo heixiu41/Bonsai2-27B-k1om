@@ -304,6 +304,7 @@ static int mm_stage(bonsai_model *m, const float *x, const float *signs,
  * (PQ2_DROWS_FAILED), falling back to the per-call builder. */
 #define PQ2_DROWS_FAILED ((float *)(uintptr_t)1)
 static int mm_drows_disabled = -1;      /* -1 unknown, 0 enabled, 1 disabled */
+static int mm_pack_disabled = -1;       /* BONSAI_NO_PACK: A/B switch */
 static uint64_t mm_drows_bytes = 0;
 static int mm_drows_count = 0;
 
@@ -327,6 +328,28 @@ static const float *mm_drows_for(bonsai_model *m, const bonsai_tensor *tc,
     }
     pq2_build_drows_mt(bonsai_tensor_data(m->g, t), rb, nblk, d, dr);
     t->drows = dr;
+    /* Codes-only repack, immediately after (and never before) the drows read
+     * the fp16 scales: 34 -> 32 bytes per block, in place, no new allocation.
+     * Every later mm_run of this tensor takes the packed kernel.  The cast is
+     * the deliberate exception to bonsai_tensor_data()'s const: this rewrites
+     * the loader's own copy of the weights, once, before any other reader. */
+    /* Codes-only repack (34 -> 32 bytes per block, in place, no allocation).
+     * OPT-IN (BONSAI_PACK=1), because the end-to-end A/B could not show a win:
+     * interleaved same-binary 64-token decode gave 3.770 tok/s at 34 bytes vs
+     * 3.747 at 32 (median of 3 each, -0.62%).  The kernel itself IS faster --
+     * the probe measures +7.8%..+9.2% at 1 thread, bit-identical on all five
+     * shapes -- because the saving is instruction count, and at 244 threads
+     * this matvec is memory-LATENCY bound, so 2 of ~30 instructions do not
+     * matter.  It also cannot shrink RSS: the holes are scattered through the
+     * same allocation.  Kept because the mechanism is proven and the regime
+     * where it pays (few threads) is exactly what a future single-threaded or
+     * issue-bound variant would use. */
+    if (mm_pack_disabled < 0)
+        mm_pack_disabled = (getenv("BONSAI_PACK") == NULL);
+    if (!mm_pack_disabled) {
+        pq2_repack_rows_inplace((uint8_t *)bonsai_tensor_data(m->g, t), nblk, d);
+        t->packed = 1;
+    }
     mm_drows_bytes += (uint64_t)nblk_pad * (uint64_t)d * sizeof(float);
     if ((++mm_drows_count & 127) == 0)
         printf("drows: %d tensors, %.1f MB (lazy)\n", mm_drows_count,
@@ -370,7 +393,11 @@ static int mm_run(bonsai_model *m, float *y, const char *wname, int n,
     /* Precomputed drow table (built lazily on first use; bit-identical to
      * the per-call builder, proven in src/probes/pq2drow.c). */
     const float *dr = mm_drows_for(m, t, n, d);
-    if (dr)
+    if (dr && t->packed)
+        /* codes-only rows: 32-byte stride, one aligned upconverting load per
+         * 16 code bytes instead of the two-instruction unpack pair */
+        pq2_0_matvec_knc_xp_packed(y, m->sc.fold_xp, w, n, d, dr, rescale);
+    else if (dr)
         pq2_0_matvec_knc_xp_dpre(y, m->sc.fold_xp, w, n, d, dr, rescale);
     else
         pq2_0_matvec_knc_xp(y, m->sc.fold_xp, w, n, d, rescale);

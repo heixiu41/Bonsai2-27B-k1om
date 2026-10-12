@@ -597,6 +597,138 @@ static inline void pq2_0_matvec_knc_xp_dpre(float *y, const float *xp,
     }
 }
 
+/* ------------------------------------------------------------------------
+ * Codes-only repack ("packed") layout: 32 bytes per block, no fp16 scale, all
+ * blocks contiguous.
+ *
+ * With the 34-byte PQ2_0 stride the code payload sits at blk+2, which is only
+ * 2-byte aligned, so the byte->dword widening needs the arbitrary-offset
+ * lo/hi unpack pair (vpxord + vloadunpackld + vloadunpackhd) per 16 code
+ * bytes -- and it over-reads up to 48 bytes past the block.  Dropping the
+ * scale bytes makes the stride 32, so halves sit at 32b and 32b+16: both are
+ * 16-byte aligned, which is exactly what the upconverting load needs.  Measured
+ * on the card (src/probes/pq2repack.c): the aligned load is ONE vmovdqa32
+ * {uint8} and is lane-for-lane identical to PQ2_IMCI_LOAD16 at every
+ * 16-byte-aligned offset (16/16 offsets, 0 mismatches), both giving
+ * dword i = p[i].  Per block that replaces ~6 instructions (2 x [vpxord +
+ * vloadunpackld + vloadunpackhd]) with 2, and the over-read disappears.
+ *
+ * Preconditions: the codes of block b are at (row + 32*b), row is 16-byte
+ * aligned.  Odd blocks (32*b with b odd) are 32-byte aligned, which satisfies
+ * the 16-byte requirement, so no odd-block tail handler is needed.
+ * ------------------------------------------------------------------------ */
+#define PQ2_0_PACKED_BLOCK_BYTES 32
+
+/* Compress a tensor's rows IN PLACE from the 34-byte PQ2_0 stride to the
+ * 32-byte codes-only stride: block b's 32 code bytes (source bytes 2..34) move
+ * to b*32 and the fp16 scale bytes are dropped.
+ *
+ * No scratch buffer, by construction: the write pointer never overtakes the
+ * read pointer within a row (32b <= 34b for every b, equality only at b == 0),
+ * and rows are walked from the FIRST because 32n < 34n makes every row's write
+ * range end below that row's own read range.  The compressed tensor therefore
+ * stays entirely inside its original extent -- the trailing 2*nblk*nrows bytes
+ * of the tensor just become dead space (which is why this saves instructions,
+ * not resident pages: the holes are scattered and cannot be released).
+ *
+ * ORDERING IS LOAD-BEARING: the fp16 scales this drops are what
+ * pq2_build_drows_mt reads, so it must run AFTER the drows for this tensor
+ * exist.  model.c calls it from the same lazy trigger, immediately after.
+ * `base` must be the tensor's data pointer (16-byte aligned); the 32-byte
+ * stride keeps every block 16-byte aligned, which is what the packed kernel's
+ * upconverting load needs.  n must be a multiple of QK_PQ2_0. */
+static inline void pq2_repack_rows_inplace(uint8_t *base, int nblk, int nrows) {
+    const size_t r32 = (size_t)nblk * PQ2_0_PACKED_BLOCK_BYTES;
+    const size_t r34 = (size_t)nblk * PQ2_0_BLOCK_BYTES;
+    for (int i = 0; i < nrows; ++i) {
+        uint8_t *dst = base + (size_t)i * r32;
+        const uint8_t *src = base + (size_t)i * r34;
+        for (int b = 0; b < nblk; ++b) {
+            memmove(dst, src + 2, 32);      /* overlapping by 2 bytes */
+            dst += PQ2_0_PACKED_BLOCK_BYTES;
+            src += PQ2_0_BLOCK_BYTES;
+        }
+    }
+}
+
+/* 16 code bytes at a 16-byte-aligned address -> 16 dwords, dword i = p[i]. */
+#define PQ2_IMCI_LOAD16A(p) \
+    _mm512_extload_epi32((const void *)(p), _MM_UPCONV_EPI32_UINT8, \
+                         _MM_BROADCAST32_NONE, _MM_HINT_NONE)
+
+/* Same body as pq2_row_block_sum, with the packed loads and stride.  Kept as
+ * its own function rather than a third branch inside the hot loop so the
+ * instruction count is what the probe measures. */
+static inline __m512 pq2_row_block_sum_packed(const uint8_t *qp,
+                                              const float *x0,
+                                              const float *dp, int b,
+                                              int rescale) {
+    const __m512 l0b = pq2_lut_a(), l1b = pq2_lut_b();
+    __m512 s = _mm512_setzero_ps();
+    if (rescale) {
+        const __m512i l0 = _mm512_castps_si512(l0b);
+        const __m512i l1 = _mm512_castps_si512(l1b);
+        do {
+            const __m512 vd = _mm512_set1_ps(*dp);
+            const __m512i c0 = PQ2_IMCI_LOAD16A(qp);
+            const __m512i c1 = PQ2_IMCI_LOAD16A(qp + 16);
+            const __m512i e0 = _mm512_srli_epi32(c0, 4);
+            const __m512i e1 = _mm512_srli_epi32(c1, 4);
+            __m512 t = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l0)), _mm512_load_ps(x0));
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l1)), _mm512_load_ps(x0 + 16), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l0)), _mm512_load_ps(x0 + 32), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l1)), _mm512_load_ps(x0 + 48), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l0)), _mm512_load_ps(x0 + 64), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l1)), _mm512_load_ps(x0 + 80), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l0)), _mm512_load_ps(x0 + 96), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l1)), _mm512_load_ps(x0 +112), t);
+            s = _mm512_fmadd_ps(vd, t, s);
+            qp += PQ2_0_PACKED_BLOCK_BYTES;
+            x0 += QK_PQ2_0;
+            ++dp;
+        } while (--b);
+    } else {
+        do {
+            const __m512 vd = _mm512_set1_ps(*dp);
+            const __m512i l0 = _mm512_castps_si512(_mm512_mul_ps(l0b, vd));
+            const __m512i l1 = _mm512_castps_si512(_mm512_mul_ps(l1b, vd));
+            const __m512i c0 = PQ2_IMCI_LOAD16A(qp);
+            const __m512i c1 = PQ2_IMCI_LOAD16A(qp + 16);
+            const __m512i e0 = _mm512_srli_epi32(c0, 4);
+            const __m512i e1 = _mm512_srli_epi32(c1, 4);
+            __m512 t = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l0)), _mm512_load_ps(x0));
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l1)), _mm512_load_ps(x0 + 16), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l0)), _mm512_load_ps(x0 + 32), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l1)), _mm512_load_ps(x0 + 48), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l0)), _mm512_load_ps(x0 + 64), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l1)), _mm512_load_ps(x0 + 80), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l0)), _mm512_load_ps(x0 + 96), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l1)), _mm512_load_ps(x0 +112), t);
+            s = _mm512_add_ps(s, t);
+            qp += PQ2_0_PACKED_BLOCK_BYTES;
+            x0 += QK_PQ2_0;
+            ++dp;
+        } while (--b);
+    }
+    return s;
+}
+
+/* Packed twin of pq2_0_matvec_knc_xp_dpre: `w` holds nblk*32 bytes per row. */
+static inline void pq2_0_matvec_knc_xp_packed(float *y, const float *xp,
+                                              const uint8_t *w, int n, int d,
+                                              const float *drows, int rescale) {
+    const int nblk     = n / QK_PQ2_0;
+    const int nblk_pad = (nblk + 15) & ~15;
+    const size_t rb    = (size_t)nblk * PQ2_0_PACKED_BLOCK_BYTES;
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < d; ++i) {
+        const __m512 s = pq2_row_block_sum_packed(
+            w + (size_t)i * rb, xp, drows + (size_t)i * nblk_pad, nblk, rescale);
+        y[i] = _mm512_reduce_add_ps(s);
+    }
+}
+
 /* One-time (per model load) builder: every row's drow, omp-parallel over
  * rows, same builder the hot kernel uses per call. Thread-private: row i
  * writes only its own drows[i*nblk_pad .. (i+1)*nblk_pad) slice.
