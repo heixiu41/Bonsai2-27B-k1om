@@ -222,7 +222,7 @@ fork 源码     D:\llama-prism-src\llama.cpp-prism\
 
 | 项 | 状态 |
 |---|---|
-| **性能** | 3.73 tok/s decode。matvec 内核 ~63%（已处于 shape 混合后的满速），drow 懒预计算已落地（+799 MB 常驻，逐位一致）。README 上剩的三条杠杆已逐条做完，见 `ENGINE_TWEAKS_AB.md`：**prefill 输出头跳过已落地（+5.3% prefill，32 token 贪心序列逐 token 一致）**；**块内 rescale 变体已实现但默认关闭**（同二进制 A/B 两次跑出 +2.72% / −2.10%，落在 ±6% 跨进程噪声内，收益未确证，`BONSAI_RESCALE=1` 可开）；**vexp223ps 向量化 exp 是负结果**——icc 早就把逐元素 `expf` 变成 `__svml_expf16`，手写实测 1.03x，别再查。另做了 **codes-only 重打包**（34→32 字节/块，见 `REPACK_CODES_ONLY.md`）：机制**已证明且逐位一致**、内核**单线程 +7.8%…+9.2%**，但 244 线程端到端**无收益**（交错的同二进制 A/B：3.770 → 3.747 tok/s，−0.62%），故 `BONSAI_PACK=1` 可选、默认关闭；"省 0.4 GB 常驻"**不成立**（空洞散布在同一分配里，RSS 仍是 9.03 GiB） |
+| **性能** | 3.73 tok/s decode。matvec 内核 ~63%（已处于 shape 混合后的满速），drow 懒预计算已落地（+799 MB 常驻，逐位一致）。README 上剩的三条杠杆已逐条做完，见 `ENGINE_TWEAKS_AB.md`：**prefill 输出头跳过已落地（+5.3% prefill，32 token 贪心序列逐 token 一致）**；**块内 rescale 变体已实现但默认关闭**（同二进制 A/B 两次跑出 +2.72% / −2.10%，落在 ±6% 跨进程噪声内，收益未确证，`BONSAI_RESCALE=1` 可开）；**vexp223ps 向量化 exp 是负结果**——icc 早就把逐元素 `expf` 变成 `__svml_expf16`，手写实测 1.03x，别再查。另做了 **codes-only 重打包**（34→32 字节/块，见 `REPACK_CODES_ONLY.md`）：机制**已证明且逐位一致**、内核**单线程 +7.8%…+9.2%**，但 244 线程端到端**效应落在噪声内**（交错的同二进制 A/B：3.715 → 3.739 tok/s，+0.66%，噪声地板约 ±0.6%），故 `BONSAI_PACK=1` 可选、默认关闭；"省 0.4 GB 常驻"**不成立**（空洞散布在同一分配里，RSS 仍是 9.03 GiB）。附带真实改进：每块越界读 48 字节的隐患消失 |
 | **C 版分词器** | ✅ 已有 Python 纯 stdlib 版（`scripts/chat.py`，含 chat template 与流式解码）；C 版仍未做 |
 | **COI 缓冲映射** | 未做 —— 完成可省掉模型上传并腾出 6.8 GB 卡内存 |
 | **长上下文** | `pos > 5` / `ctx > 256` 未测试 |

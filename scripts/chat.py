@@ -465,17 +465,19 @@ def ensure_card_files(host: str, gguf: str) -> bool:
               file=sys.stderr)
         return False
     have = r.stdout
-    if "bonsai_k1om_chat" not in have:
-        local_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "..", "bonsai_k1om_chat")
+    # Size-checked, not just "exists": the chat binary is rebuilt far more
+    # often than the model changes, and a stale copy on the card silently
+    # invalidates every measurement taken through it (it made an A/B compare
+    # two identical builds and look like a clean null result).
+    local_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "bonsai_k1om_chat")
+    if "bonsai_k1om_chat" not in have or \
+            _card_file_size(host, base, "/tmp/bonsai_k1om_chat") != \
+            os.path.getsize(local_bin):
         print("uploading chat binary ...", flush=True)
-        r = _run_detached(["scp", "-O", "-c", "chacha20-poly1305@openssh.com",
-                            *base, local_bin, f"{host}:/tmp/"])
-        if r.returncode != 0:
+        if not _ensure_card_binary(host, base, local_bin, "bonsai_k1om_chat"):
             print("[fatal] binary upload failed", file=sys.stderr)
             return False
-        _run_detached(["ssh", *base, host, "chmod +x /tmp/bonsai_k1om_chat"],
-                       capture_output=True)
     if "libiomp5.so" not in have:
         # The chat binary is an OpenMP build and the card has no libiomp5.so of
         # its own, so a cold start must push it too -- previously this was a
