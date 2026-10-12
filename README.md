@@ -202,6 +202,7 @@ fork 源码     D:\llama-prism-src\llama.cpp-prism\
 | `pq2_0_imci_decoder.md` | 向量化解码器完整报告 |
 | `WORKORDER_PARALLEL_OVERHEAD.md` | **下一步作业说明**（parallel region 开销） |
 | `FINAL_STATUS_K1OM.md` | 交付状态（含更正头） |
+| `ENGINE_TWEAKS_AB.md` | README 三条剩余杠杆的实测结论（含一条负结果与一条默认关闭） |
 | `PERFORMANCE_OPTIMIZATION.md` | 性能分析（已修正带宽错误） |
 | `GDN_ROOTCAUSE.md` / `GDN_AXIS_AND_L2_FINDINGS.md` / `_AUDIT_GDN_C_vs_PY.md` | GDN 递推的调试过程 |
 | `KNC_INTEGER_SIMD.md` | KNC 指令可用性实测清单 |
@@ -220,7 +221,7 @@ fork 源码     D:\llama-prism-src\llama.cpp-prism\
 
 | 项 | 状态 |
 |---|---|
-| **性能** | 3.73 tok/s decode。matvec 内核 ~63%（已处于 shape 混合后的满速），drow 懒预计算已落地（+799 MB 常驻，逐位一致），剩余杠杆：块内 rescale 变体（0-19 ms，1e-7 级漂移，需 A/B）、prefill 输出头跳过（~5% prefill）、vexp223ps 向量化 exp（<0.5 ms） |
+| **性能** | 3.73 tok/s decode。matvec 内核 ~63%（已处于 shape 混合后的满速），drow 懒预计算已落地（+799 MB 常驻，逐位一致）。README 上剩的三条杠杆已逐条做完，见 `ENGINE_TWEAKS_AB.md`：**prefill 输出头跳过已落地（+5.3% prefill，32 token 贪心序列逐 token 一致）**；**块内 rescale 变体已实现但默认关闭**（同二进制 A/B 两次跑出 +2.72% / −2.10%，落在 ±6% 跨进程噪声内，收益未确证，`BONSAI_RESCALE=1` 可开）；**vexp223ps 向量化 exp 是负结果**——icc 早就把逐元素 `expf` 变成 `__svml_expf16`，手写实测 1.03x，别再查 |
 | **C 版分词器** | ✅ 已有 Python 纯 stdlib 版（`scripts/chat.py`，含 chat template 与流式解码）；C 版仍未做 |
 | **COI 缓冲映射** | 未做 —— 完成可省掉模型上传并腾出 6.8 GB 卡内存 |
 | **长上下文** | `pos > 5` / `ctx > 256` 未测试 |

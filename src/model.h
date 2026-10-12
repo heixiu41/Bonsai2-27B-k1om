@@ -192,6 +192,11 @@ void bonsai_reset(bonsai_model *m);
 /* Run one token at position `pos`, filling m->sc.logits.
  * Returns 0 on success. */
 int bonsai_forward(bonsai_model *m, int32_t token, int32_t pos);
+/* Same state update and attention work, but skips the final RMSNorm + the
+ * n_vocab-wide output head.  Prefill only needs the logits of its LAST token,
+ * so the earlier prompt tokens can use this (~5% of prefill); m->sc.logits is
+ * left untouched, so do NOT read it after a nologits call. */
+int bonsai_forward_nologits(bonsai_model *m, int32_t token, int32_t pos);
 
 /* Greedy decode from a token sequence. Writes `n_out` ids into `out`.
  * Returns the number actually produced. */

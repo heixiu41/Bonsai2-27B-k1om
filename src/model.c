@@ -360,13 +360,20 @@ static int mm_run(bonsai_model *m, float *y, const char *wname, int n,
     const int d = (int)t->dims[1];      /* ggml ne1 = output dim */
 
 #ifdef __MIC__
+    /* Rescale variant of the F3 block loop: one fp32 rounding per 128-weight
+     * block instead of one per element, i.e. a ~1e-7-class numerical drift
+     * (see pq2_0.h:pq2_row_block_sum).  OFF by default: the A/B could not
+     * establish a win (it measured +2.7% and -2.1% in two runs of the same
+     * comparison, inside +-6% cross-process drift), so the bit-exact F3 order
+     * stays the default and BONSAI_RESCALE=1 opts in. */
+    const int rescale = pq2_rescale_default();
     /* Precomputed drow table (built lazily on first use; bit-identical to
      * the per-call builder, proven in src/probes/pq2drow.c). */
     const float *dr = mm_drows_for(m, t, n, d);
     if (dr)
-        pq2_0_matvec_knc_xp_dpre(y, m->sc.fold_xp, w, n, d, dr);
+        pq2_0_matvec_knc_xp_dpre(y, m->sc.fold_xp, w, n, d, dr, rescale);
     else
-        pq2_0_matvec_knc_xp(y, m->sc.fold_xp, w, n, d);
+        pq2_0_matvec_knc_xp(y, m->sc.fold_xp, w, n, d, rescale);
 #else
     pq2_0_matvec_ref(y, m->sc.fold_x, w, n, d);
 #endif
@@ -1338,7 +1345,12 @@ static int embed_row(bonsai_model *m, int32_t token, float *out) {
     return 0;
 }
 
-int bonsai_forward(bonsai_model *m, int32_t token, int32_t pos) {
+/* want_logits == 0 skips the final RMSNorm + the vocabulary-wide output head.
+ * Prefill only needs the logits of its LAST token, so every earlier prompt
+ * token can skip the whole n_vocab projection (~5% of prefill).  The KV cache
+ * and the recurrent state are unaffected: the head is pure read-out. */
+static int forward_body(bonsai_model *m, int32_t token, int32_t pos,
+                        int want_logits) {
     bonsai_scratch *s = &m->sc;
     if (m->full_attn_interval <= 0) {
         fprintf(stderr, "forward: bad full_attn_interval %d\n",
@@ -1383,12 +1395,23 @@ int bonsai_forward(bonsai_model *m, int32_t token, int32_t pos) {
     }
     m->st.kv_len = pos + 1;
 
+    if (!want_logits)
+        return 0;
+
     /* final norm + output head (folded with the width-5120 signs) */
     rmsnorm(s->xb, s->x, m->wc.output_norm, m->n_embd, m->rms_eps);
     if (mm_folded(m, s->logits, s->xb, "output.weight", m->signs_5120,
                   m->n_embd, m->n_vocab) != 0)
         return -1;
     return 0;
+}
+
+int bonsai_forward(bonsai_model *m, int32_t token, int32_t pos) {
+    return forward_body(m, token, pos, 1);
+}
+
+int bonsai_forward_nologits(bonsai_model *m, int32_t token, int32_t pos) {
+    return forward_body(m, token, pos, 0);
 }
 
 int bonsai_generate(bonsai_model *m, const int32_t *prompt, int32_t n_prompt,

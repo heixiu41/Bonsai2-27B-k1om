@@ -61,6 +61,15 @@ static void usage(const char *argv0) {
  * Unknown lines get "ERR <line>". The model loads ONCE at startup; the
  * caller keeps the pipe open for the whole chat session. */
 #define CHAT_CTX 8192
+/* Prefill only needs the logits of its LAST token, so the earlier prompt
+ * tokens skip the n_vocab-wide output head.  BONSAI_NO_PREFILL_SKIP=1 restores
+ * the old "compute it every token" behaviour; that switch is how the A/B was
+ * run (one binary, both orders). */
+static int prefill_skip_head(void) {
+    static int r = -1;
+    if (r < 0) r = (getenv("BONSAI_NO_PREFILL_SKIP") == NULL);
+    return r;
+}
 static int chat_mode(bonsai_model *m) {
     char line[65536];
     int32_t pos = 0;
@@ -83,8 +92,15 @@ static int chat_mode(bonsai_model *m) {
             printf("OK\n");
         } else if (cmd == 'P') {
             /* NB: a Windows client in text mode sends \r\n -- treat \r as
-             * whitespace/terminator or the last token fails strtol. */
-            int fail = 0;
+             * whitespace/terminator or the last token fails strtol.
+             *
+             * One token of lookahead: only the LAST prompt token needs logits
+             * (the first G reads them), so every earlier token goes through
+             * bonsai_forward_nologits and skips the n_vocab-wide output head
+             * -- the whole prefill is read-out-free until its final token. */
+            int fail = 0, have = 0;
+            int32_t pend = 0;
+            const int skip = prefill_skip_head();
             char *end = p;
             for (;;) {
                 while (*end == ' ' || *end == '\t' || *end == '\r') ++end;
@@ -93,8 +109,19 @@ static int chat_mode(bonsai_model *m) {
                 const long v = strtol(end, &next, 10);
                 if (next == end || v < 0 || v > ntok_max) { fail = 1; break; }
                 end = next;
+                if (have) {
+                    if (pos >= m->ctx) { fail = 2; break; }
+                    const int rc = skip ? bonsai_forward_nologits(m, pend, pos)
+                                        : bonsai_forward(m, pend, pos);
+                    ++pos;
+                    if (rc != 0) { fail = 2; break; }
+                }
+                pend = (int32_t)v;
+                have = 1;
+            }
+            if (!fail && have) {
                 if (pos >= m->ctx ||
-                    bonsai_forward(m, (int32_t)v, pos++) != 0) { fail = 2; break; }
+                    bonsai_forward(m, pend, pos++) != 0) fail = 2;
             }
             printf(fail ? "ERR prompt (code %d)\n" : "OK\n", fail);
         } else if (cmd == 'G') {

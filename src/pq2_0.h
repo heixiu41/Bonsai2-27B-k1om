@@ -461,30 +461,66 @@ static inline int pq2_build_drow(const uint8_t *row, int nblk, float *drow) {
 }
 
 #ifndef BONSAI_FORCE_SCALAR_PQ2_0
+/* Which block-loop order to use.  Default = the old bit-exact F3 order;
+ * BONSAI_RESCALE=1 opts into the rescale variant (see pq2_row_block_sum).
+ *
+ * The variant is OFF by default because its win could NOT be established: in
+ * the end-to-end same-binary A/B it came out +2.7% in one comparison and -2.1%
+ * in another, i.e. inside the +-6% process-to-process drift, and a
+ * cache-resident kernel probe is not representative of the real 7.2 GB/token
+ * DRAM stream.  Shipping an unproven ~1e-7 drift for an unproven gain is the
+ * wrong trade; the switch stays for a properly-sized future measurement.
+ * Read once per process.  One source of truth for every caller: model.c's
+ * mm_run and the convenience wrapper below. */
+static inline int pq2_rescale_default(void) {
+    static int r = -1;
+    if (r < 0) r = (getenv("BONSAI_RESCALE") != NULL);
+    return r;
+}
+
 /* Kernel body with the permuted activation PREBUILT by the caller (mm_stage
  * builds it once per staged input; the 2-3 matvecs sharing that input then
  * skip the build entirely). xp must be 64-byte aligned and hold n floats;
  * n must be a multiple of QK_PQ2_0 (checked by the wrapper/caller). */
-static inline void pq2_0_matvec_knc_xp(float *y, const float *xp,
-                                       const uint8_t *w, int n, int d) {
-    const int nn = n;                       /* multiple of QK_PQ2_0 */
-    const size_t rb = ((size_t)n + QK_PQ2_0 - 1) / QK_PQ2_0 * PQ2_0_BLOCK_BYTES;
+/* `rescale`: 0 = the F3 form (LUTs pre-multiplied by the block scale every
+ * block, 8 per-element scaled FMAs, s = add(s,t)); 1 = the rescale variant
+ * (unscaled LUTs, one extra fmadd per block: s = fmadd(vd, t, s)).  The
+ * variant drops the broadcast->2-mul prologue from the per-block dependency
+ * chain but is NOT bit-identical: it rounds once per block instead of once per
+ * element -- the same ~1e-7 drift class as the accepted V12->F3 change
+ * (docs/bonsai/REMAINING_OPT_PQ2_KERNEL.md rank 3).  Chosen per call in
+ * mm_run, so both orders A/B from ONE binary.
+ *
+ * The branch is outside the block loop on purpose: inside it, a per-block
+ * branch costs more than the 2 ops the variant removes.  Shared by both
+ * matvec bodies so the two orders cannot drift apart. */
+static inline __m512 pq2_row_block_sum(const uint8_t *blk, const float *x0,
+                                       const float *dp, int b, int rescale) {
     const __m512 l0b = pq2_lut_a(), l1b = pq2_lut_b();
-
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; ++i) {
-        /* Per-row scale vector, thread-private on the stack: this loop is
-         * omp parallel for, so a shared drow would be written by all threads
-         * at once. n <= PQ2_XP_MAX is guaranteed by model.c's width check, so
-         * nn/QK_PQ2_0 <= PQ2_XP_MAX/QK_PQ2_0 entries suffice. */
-        float drow[PQ2_XP_MAX / QK_PQ2_0] __attribute__((aligned(64)));
-        const uint8_t *row = w + (size_t)i * rb;
-        pq2_build_drow(row, nn / QK_PQ2_0, drow);
-        __m512 s = _mm512_setzero_ps();
-        const uint8_t *blk = row;
-        const float *x0 = xp;
-        const float *dp = drow;
-        int b = nn >> 7;
+    __m512 s = _mm512_setzero_ps();
+    if (rescale) {
+        const __m512i l0 = _mm512_castps_si512(l0b);
+        const __m512i l1 = _mm512_castps_si512(l1b);
+        do {
+            const __m512 vd = _mm512_set1_ps(*dp);
+            const __m512i c0 = PQ2_IMCI_LOAD16(blk + 2);
+            const __m512i c1 = PQ2_IMCI_LOAD16(blk + 18);
+            const __m512i e0 = _mm512_srli_epi32(c0, 4);
+            const __m512i e1 = _mm512_srli_epi32(c1, 4);
+            __m512 t = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l0)), _mm512_load_ps(x0));
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l1)), _mm512_load_ps(x0 + 16), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l0)), _mm512_load_ps(x0 + 32), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l1)), _mm512_load_ps(x0 + 48), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l0)), _mm512_load_ps(x0 + 64), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l1)), _mm512_load_ps(x0 + 80), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l0)), _mm512_load_ps(x0 + 96), t);
+            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l1)), _mm512_load_ps(x0 +112), t);
+            s = _mm512_fmadd_ps(vd, t, s);
+            blk += PQ2_0_BLOCK_BYTES;
+            x0  += QK_PQ2_0;
+            ++dp;
+        } while (--b);
+    } else {
         do {
             const __m512 vd = _mm512_set1_ps(*dp);
             const __m512i l0 = _mm512_castps_si512(_mm512_mul_ps(l0b, vd));
@@ -506,6 +542,26 @@ static inline void pq2_0_matvec_knc_xp(float *y, const float *xp,
             x0  += QK_PQ2_0;
             ++dp;
         } while (--b);
+    }
+    return s;
+}
+
+static inline void pq2_0_matvec_knc_xp(float *y, const float *xp,
+                                       const uint8_t *w, int n, int d,
+                                       int rescale) {
+    const int nn = n;                       /* multiple of QK_PQ2_0 */
+    const size_t rb = ((size_t)n + QK_PQ2_0 - 1) / QK_PQ2_0 * PQ2_0_BLOCK_BYTES;
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < d; ++i) {
+        /* Per-row scale vector, thread-private on the stack: this loop is
+         * omp parallel for, so a shared drow would be written by all threads
+         * at once. n <= PQ2_XP_MAX is guaranteed by model.c's width check, so
+         * nn/QK_PQ2_0 <= PQ2_XP_MAX/QK_PQ2_0 entries suffice. */
+        float drow[PQ2_XP_MAX / QK_PQ2_0] __attribute__((aligned(64)));
+        const uint8_t *row = w + (size_t)i * rb;
+        pq2_build_drow(row, nn / QK_PQ2_0, drow);
+        const __m512 s = pq2_row_block_sum(row, xp, drow, nn >> 7, rescale);
         y[i] = _mm512_reduce_add_ps(s);
     }
 }
@@ -526,42 +582,17 @@ static inline void pq2_0_matvec_knc_xp(float *y, const float *xp,
  * ------------------------------------------------------------------------ */
 static inline void pq2_0_matvec_knc_xp_dpre(float *y, const float *xp,
                                             const uint8_t *w, int n, int d,
-                                            const float *drows) {
+                                            const float *drows, int rescale) {
     const int nn = n;                       /* multiple of QK_PQ2_0 */
     const size_t rb = ((size_t)n + QK_PQ2_0 - 1) / QK_PQ2_0 * PQ2_0_BLOCK_BYTES;
-    const __m512 l0b = pq2_lut_a(), l1b = pq2_lut_b();
     const int nblk     = nn / QK_PQ2_0;
     const int nblk_pad = (nblk + 15) & ~15;
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < d; ++i) {
         const uint8_t *row = w + (size_t)i * rb;
-        __m512 s = _mm512_setzero_ps();
-        const uint8_t *blk = row;
-        const float *x0 = xp;
-        const float *dp = drows + (size_t)i * nblk_pad;
-        int b = nblk;
-        do {
-            const __m512 vd = _mm512_set1_ps(*dp);
-            const __m512i l0 = _mm512_castps_si512(_mm512_mul_ps(l0b, vd));
-            const __m512i l1 = _mm512_castps_si512(_mm512_mul_ps(l1b, vd));
-            const __m512i c0 = PQ2_IMCI_LOAD16(blk + 2);
-            const __m512i c1 = PQ2_IMCI_LOAD16(blk + 18);
-            const __m512i e0 = _mm512_srli_epi32(c0, 4);
-            const __m512i e1 = _mm512_srli_epi32(c1, 4);
-            __m512 t = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l0)), _mm512_load_ps(x0));
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c0, l1)), _mm512_load_ps(x0 + 16), t);
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l0)), _mm512_load_ps(x0 + 32), t);
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e0, l1)), _mm512_load_ps(x0 + 48), t);
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l0)), _mm512_load_ps(x0 + 64), t);
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(c1, l1)), _mm512_load_ps(x0 + 80), t);
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l0)), _mm512_load_ps(x0 + 96), t);
-            t = _mm512_fmadd_ps(_mm512_castsi512_ps(_mm512_permutevar_epi32(e1, l1)), _mm512_load_ps(x0 +112), t);
-            s = _mm512_add_ps(s, t);
-            blk += PQ2_0_BLOCK_BYTES;
-            x0  += QK_PQ2_0;
-            ++dp;
-        } while (--b);
+        const __m512 s = pq2_row_block_sum(row, xp, drows + (size_t)i * nblk_pad,
+                                           nblk, rescale);
         y[i] = _mm512_reduce_add_ps(s);
     }
 }
@@ -600,7 +631,7 @@ static inline void pq2_0_matvec_knc(float *y, const float *x,
         return;
     }
     pq2_build_xp(x, xp, n);
-    pq2_0_matvec_knc_xp(y, xp, w, n, d);
+    pq2_0_matvec_knc_xp(y, xp, w, n, d, pq2_rescale_default());
 }
 
 /* The previous (pre-V12) IMCI kernel, kept verbatim for reference and for

@@ -189,7 +189,7 @@ static double measure(int use_pre, int t, uint8_t **W, float **DR,
             const int nb = (r * 997 + s * 37) % nblk;
             W[s][(size_t)nb * PQ2_0_BLOCK_BYTES + 2 + (r & 31)] ^= 1;  /* code byte */
             if (use_pre) pq2_0_matvec_knc_xp_dpre(y, XP[s], W[s], T[s].n, T[s].d, DR[s]);
-            else         pq2_0_matvec_knc_xp(y, XP[s], W[s], T[s].n, T[s].d);
+            else         pq2_0_matvec_knc_xp(y, XP[s], W[s], T[s].n, T[s].d, 0);
             sink += y[(r * 7 + s) % (T[s].d - 1)];
         }
         const double t1 = now_s();
@@ -232,7 +232,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n; ++i) x[i] = (float)((i % 13) - 6) * 0.0625f;
             pq2_build_xp(x, xp, n);
             pq2_build_all_drows(w, n, d, dr);
-            pq2_0_matvec_knc_xp(y1, xp, w, n, d);
+            pq2_0_matvec_knc_xp(y1, xp, w, n, d, 0);
             pq2_0_matvec_knc_xp_dpre(y2, xp, w, n, d, dr);
             int mis = 0, first = -1;
             for (int i = 0; i < d; ++i) {

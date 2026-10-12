@@ -15,7 +15,12 @@
      `_mm512_fixupnan_ps` / `_mm512_multishift_epi64_epi8` → 编译直接拒绝或模拟
 3. **验证为真硬件的 KNC 特有指令**（反汇编单条助记符）：
    - `vrcp23ps` / `vrsqrt23ps` — 23-bit 精度倒数/倒数平方根（1 条指令）
-   - `vexp223ps` — 2^x − 1，23-bit 精度（1 条指令）；exp(x) = vexp223ps(x·log2e)+1
+   - `vexp223ps` — **2^(v / 2^24)，v 是 Q24 定点整数**（1 条指令，需配 `vcvtfxpntps2dq $80`）。
+     用法：`vexp223ps(cvtfxpnt_q24(x·log2e))`。**更正**：早期这里写的是
+     "2^x − 1，exp(x) = vexp223ps(x·log2e)+1"，2026-10-12 的探针实测推翻了它——
+     那个 `+1` 会让 `exp(0)=2.0`；整数锚点（`v=0→1.0`、`v=±2^23→2^±0.5`）证明输入是
+     2^24 定标而不是 float，输出不含 −1。精度实测最差相对误差 9.4e-7，
+     深负数干净下溢到 0（不是 NaN）。详见 `ENGINE_TWEAKS_AB.md` §3。
    - `vscaleps` — a × 2^floor(b)（exp/ldexp 构件）
    - `vloadunpacklps/hps` — 真正的非对齐加载对（目前数据全对齐，用不上）
    - **免费 swizzle**：`vmovaps %zmm0{cdab}, %zmm0` — 寄存器移动/访存操作数可直接
@@ -29,7 +34,7 @@
 
 | 项 | 机制 | 预估 | 风险 |
 |---|---|---|---|
-| 向量 exp（vexp223ps+rcp23ps） | attention softmax / sigmoid gate / silu 的 expf 是 libm 标量 ~50cyc/个；向量版 16-wide ~几条指令 | ~0.3-0.5 ms/token（这些路径已并行化，基数小） | 精度 2^-23 ≈ 1.2e-7 相对误差，drift 级；需 top-1/rank 门 + A/B |
+| 向量 exp（vexp223ps+rcp23ps） | attention softmax / sigmoid gate / silu 的 expf 是 libm 标量 ~50cyc/个；向量版 16-wide ~几条指令 | ~0.3-0.5 ms/token（这些路径已并行化，基数小） | **已实测为负结果**：icc 早就把逐元素 `expf` 变成 `__svml_expf16`（`model.c` 汇编可见），手写 `vexp223ps` 实测只有 1.03x。不要再查这条 —— 见 `ENGINE_TWEAKS_AB.md` §3 |
 | rsqrt23 进 rmsnorm | 129 次/token 的 1/sqrtf 是标量 | 噪声级 | — |
 | loadunpack | 解除对齐约束 | 防御性，非性能 | — |
 
